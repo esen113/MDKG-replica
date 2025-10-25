@@ -137,6 +137,16 @@ class Evaluator:
     def store_predictions(self):
         predictions = []
 
+        def _find_entity_index(entities, target):
+            for idx, ent in enumerate(entities):
+                if (
+                    ent.get("type") == target.get("type")
+                    and ent.get("start") == target.get("start")
+                    and ent.get("end") == target.get("end")
+                ):
+                    return idx
+            return None
+
         for i, doc in enumerate(self._dataset.documents):
             tokens = doc.tokens
             pred_entities = self._pred_entities[i]
@@ -170,8 +180,11 @@ class Evaluator:
                 converted_tail = dict(type=tail_type, start=tail_span_tokens[0].index,
                                       end=tail_span_tokens[-1].index + 1)
 
-                head_idx = converted_entities.index(converted_head)
-                tail_idx = converted_entities.index(converted_tail)
+                head_idx = _find_entity_index(converted_entities, converted_head)
+                tail_idx = _find_entity_index(converted_entities, converted_tail)
+
+                if head_idx is None or tail_idx is None:
+                    continue
 
                 converted_relation = dict(type=relation_type,
                                           head=head_idx,
@@ -639,3 +652,4 @@ class Evaluator:
 
         # write to disc
         template.stream(examples=examples).dump(file_path)
+
