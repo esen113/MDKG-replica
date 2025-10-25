@@ -23,6 +23,8 @@ TYPES_PATH = (REPO_ROOT / "nutrition_diabetes_types.json").resolve()
 RUN_LABEL = "diabetes_small_run"
 SEED = 11
 
+DEFAULT_EVAL_LABEL = f"{RUN_LABEL}_eval"
+
 
 def ensure_directories():
     for path in [LOG_PATH, SAVE_PATH, CACHE_PATH]:
@@ -101,19 +103,23 @@ def build_train_args() -> list:
     ]
 
 
-def build_eval_args(model_dir: Path) -> list:
-    return [
+def build_eval_args(cli_args: argparse.Namespace) -> list:
+    dataset_path = cli_args.dataset_path
+    label = cli_args.label or DEFAULT_EVAL_LABEL
+    model_dir = cli_args.model_dir
+
+    args = [
         "eval",
         "--model_type",
         MODEL_TYPE,
         "--label",
-        f"{RUN_LABEL}_eval",
+        label,
         "--model_path",
         str(model_dir),
         "--tokenizer_path",
         str(model_dir),
         "--dataset_path",
-        str(TEST_PATH),
+        str(dataset_path),
         "--types_path",
         str(TYPES_PATH),
         "--cache_path",
@@ -147,7 +153,6 @@ def build_eval_args(model_dir: Path) -> list:
         "0",
         "--sampling_limit",
         "100",
-        "--store_predictions",
         "--store_examples",
         "--log_path",
         str(LOG_PATH),
@@ -161,6 +166,13 @@ def build_eval_args(model_dir: Path) -> list:
         str(SEED),
     ]
 
+    if cli_args.al_dump_dir:
+        args.extend(["--al_dump_dir", str(cli_args.al_dump_dir)])
+    if cli_args.store_predictions:
+        args.append("--store_predictions")
+
+    return args
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Utility entrypoint for SynSpERT experiments.")
@@ -170,6 +182,37 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=SAVE_PATH,
         help="Model directory to use when running in eval mode.",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=Path,
+        default=TEST_PATH,
+        help="Dataset file to evaluate when running in eval mode.",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=DEFAULT_EVAL_LABEL,
+        help="Run label used for evaluation logs and checkpoints.",
+    )
+    parser.add_argument(
+        "--al_dump_dir",
+        type=Path,
+        default=None,
+        help="If set, dump active-learning features to this directory during eval.",
+    )
+    parser.add_argument(
+        "--store_predictions",
+        dest="store_predictions",
+        action="store_true",
+        default=True,
+        help="Store prediction JSON during evaluation (enabled by default).",
+    )
+    parser.add_argument(
+        "--no_store_predictions",
+        dest="store_predictions",
+        action="store_false",
+        help="Disable storing predictions during evaluation.",
     )
     return parser.parse_args()
 
@@ -181,7 +224,7 @@ def main():
     if args.mode == "train":
         run_args = build_train_args()
     else:
-        run_args = build_eval_args(args.model_dir)
+        run_args = build_eval_args(args)
 
     print("*** Commandline:", " ".join(run_args))
     runner = Runner.Runner()
