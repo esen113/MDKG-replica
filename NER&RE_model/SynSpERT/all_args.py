@@ -35,6 +35,10 @@ def get_argparser():
     arg_parser.add_argument('--example_count', type=int, default=None,
                             help="Count of evaluation example to store (if store_examples == True)")
     arg_parser.add_argument('--debug', action='store_true', default=False, help="Debugging mode on/off")
+    arg_parser.add_argument('--skip_eval', action='store_true', default=False,
+                            help="If true, skip validation during training.")
+    arg_parser.add_argument('--al_dump_dir', type=str, default=None,
+                            help="If set, dump uncertainty features for active learning to this directory.")
 
     # Model / Training / Evaluation
     arg_parser.add_argument('--model_path', type=str, help="Path to directory that contains model checkpoints")

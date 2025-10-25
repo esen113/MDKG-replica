@@ -3,15 +3,17 @@ import math
 import os
 import numpy as np
 import csv
+from pathlib import Path
 from scipy.special import entr
 
 import torch
 from torch.nn import DataParallel
 import torch.nn as nn
 from torch.optim import Optimizer
+from torch.optim import AdamW
 import transformers
 from torch.utils.data import DataLoader
-from transformers import AdamW, BertConfig
+from transformers import BertConfig
 from transformers import BertTokenizer
 
 from spert import models
@@ -23,7 +25,6 @@ from spert.input_reader import JsonInputReader, BaseInputReader
 from spert.loss import SpERTLoss, Loss
 from tqdm import tqdm
 from spert.trainer import BaseTrainer
-from transformers import BertConfig
 import sys
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -83,6 +84,7 @@ class SpERTTrainer(BaseTrainer):
         args = self.args
         #ipconfig = self.config  #DKS
         train_label, valid_label = 'train', 'valid'
+        skip_eval = getattr(args, 'skip_eval', False)
 
         self._logger.info("Datasets: %s, %s" % (train_path, valid_path))
         self._logger.info("Model type: %s" % args.model_type)
@@ -157,7 +159,7 @@ class SpERTTrainer(BaseTrainer):
 
         # create optimizer
         optimizer_params = self._get_optimizer_params(model)
-        optimizer = AdamW(optimizer_params, lr=args.lr, weight_decay=args.weight_decay, correct_bias=True)
+        optimizer = AdamW(optimizer_params, lr=args.lr, weight_decay=args.weight_decay)
         # create scheduler
         scheduler = transformers.get_linear_schedule_with_warmup(optimizer,
                                                                  num_warmup_steps=args.lr_warmup * updates_total,
@@ -181,31 +183,30 @@ class SpERTTrainer(BaseTrainer):
             # train epoch
             self._train_epoch(model, compute_loss, optimizer, train_dataset, updates_epoch, epoch)
 
-            # eval validation sets [DKS]
+            if skip_eval:
+                continue
+
             if not args.final_eval or (epoch == args.epochs - 1):
-               # self._eval(model, validation_dataset, input_reader, epoch + 1, updates_epoch)
-               ner_f1_micro,rel_f1_micro = self._eval(model, validation_dataset, input_reader, epoch + 1, updates_epoch)
-               
-               #DKS: check if model is best
-               if rel_f1_micro > best_rel_f1_micro:
-                   best_rel_f1_micro=rel_f1_micro
-                   best_model=model
-                   best_epoch=epoch+1
-                   extra = dict(epoch=args.epochs, updates_epoch=updates_epoch, epoch_iteration=0)
-                   self._save_model(self._save_path, best_model, self._tokenizer, 0,
-                       optimizer=optimizer if self.args.save_optimizer else None, extra=extra,
-                       include_iteration=False, name='best_model')
-                   model_saved=True
-                   #break
-               
+                ner_f1_micro, rel_f1_micro = self._eval(model, validation_dataset, input_reader,
+                                                        epoch + 1, updates_epoch)
+
+                if rel_f1_micro > best_rel_f1_micro:
+                    best_rel_f1_micro = rel_f1_micro
+                    best_model = model
+                    best_epoch = epoch + 1
+                    extra = dict(epoch=args.epochs, updates_epoch=updates_epoch, epoch_iteration=0)
+                    self._save_model(self._save_path, best_model, self._tokenizer, 0,
+                                     optimizer=optimizer if self.args.save_optimizer else None, extra=extra,
+                                     include_iteration=False, name='best_model')
+                    model_saved = True
+                   
             
-        sys.exit(0)
-        # save final model
-        extra = dict(epoch=args.epochs, updates_epoch=updates_epoch, epoch_iteration=0)
-        global_iteration = args.epochs * updates_epoch
-        self._save_model(self._save_path, model, self._tokenizer, global_iteration,
-                         optimizer=optimizer if self.args.save_optimizer else None, extra=extra,
-                         include_iteration=False, name='final_model')
+        if skip_eval or not model_saved:
+            extra = dict(epoch=args.epochs, updates_epoch=updates_epoch, epoch_iteration=0)
+            global_iteration = args.epochs * updates_epoch
+            self._save_model(self._save_path, model, self._tokenizer, global_iteration,
+                             optimizer=optimizer if self.args.save_optimizer else None, extra=extra,
+                             include_iteration=False, name='final_model')
         
         self._logger.info("Logged in: %s" % self._log_path)
         self._logger.info("Saved in: %s" % self._save_path)
@@ -282,102 +283,87 @@ class SpERTTrainer(BaseTrainer):
 
         return iteration
 
-def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInputReader,
-          epoch: int = 0, updates_epoch: int = 0, iteration: int = 0 ):
-    self._logger.info("Evaluate: %s" % dataset.label)
-    Names = 'agu1'  # Set the name for saving files
+    def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInputReader,
+              epoch: int = 0, updates_epoch: int = 0, iteration: int = 0):
+        self._logger.info("Evaluate: %s" % dataset.label)
+        names = 'agu1'  # Set the name for saving files
 
-    if isinstance(model, DataParallel):
-        # currently no multi GPU support during evaluation
-        model = model.module
+        if isinstance(model, DataParallel):
+            model = model.module
 
-    # create evaluator
-    evaluator = Evaluator(dataset, input_reader, self._tokenizer,
-                          self.args.rel_filter_threshold, self.args.no_overlapping, self._predictions_path,
-                          self._examples_path, self.args.example_count, epoch, dataset.label)
+        evaluator = Evaluator(dataset, input_reader, self._tokenizer,
+                              self.args.rel_filter_threshold, self.args.no_overlapping, self._predictions_path,
+                              self._examples_path, self.args.example_count, epoch, dataset.label)
 
-    # create data loader
-    dataset.switch_mode(Dataset.EVAL_MODE)
-    data_loader = DataLoader(dataset, batch_size=self.args.eval_batch_size, shuffle=False, drop_last=False,
-                             num_workers=self.args.sampling_processes, collate_fn=sampling.collate_fn_padding)
+        dataset.switch_mode(Dataset.EVAL_MODE)
+        data_loader = DataLoader(dataset, batch_size=self.args.eval_batch_size, shuffle=False, drop_last=False,
+                                 num_workers=self.args.sampling_processes, collate_fn=sampling.collate_fn_padding)
 
-    with torch.no_grad():
-        model.eval()
-        n = 9  # Number of classes
+        dump_dir = getattr(self.args, 'al_dump_dir', None)
+        if dump_dir:
+            dump_dir = Path(dump_dir)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            al_entropy_rel = []
+            al_entropy_ent = []
+            al_label_counts = []
+            al_pooler = []
 
-        prediction_entropy_relation = np.ones(1,)
-        prediction_entropy_entities = np.ones(1,)
-        sentence_size = np.ones(1, )
-        prediction_label_all = np.ones(n,)
-        pooler_output_all = torch.ones(1, 768).to(device='cuda')
+        with torch.no_grad():
+            model.eval()
+            total = math.ceil(dataset.document_count / self.args.eval_batch_size)
+            for batch in tqdm(data_loader, total=total, desc='Evaluate epoch %s' % epoch):
+                batch = util.to_device(batch, self._device)
+                entity_clf, rel_clf, rels, pooler_output = model(
+                    encodings=batch['encodings'], context_masks=batch['context_masks'],
+                    entity_masks=batch['entity_masks'], entity_sizes=batch['entity_sizes'],
+                    entity_spans=batch['entity_spans'], entity_sample_masks=batch['entity_sample_masks'],
+                    dephead=batch['dephead'], deplabel=batch['deplabel'], pos=batch['pos'], evaluate=True)
+                evaluator.eval_batch(entity_clf, rel_clf, rels, batch)
 
-        # iterate batches
-        total = math.ceil(dataset.document_count / self.args.eval_batch_size)
-        for batch in tqdm(data_loader, total=total, desc='Evaluate epoch %s' % epoch):
-            # move batch to selected device
-            batch = util.to_device(batch, self._device)
+                if dump_dir:
+                    # entity entropy (softmax over entity types)
+                    entity_probs = torch.softmax(entity_clf, dim=-1)
+                    entity_entropy = -(entity_probs * torch.log(entity_probs + 1e-12)).sum(dim=-1)
+                    entity_entropy = entity_entropy * batch['entity_sample_masks'].float()
+                    entity_entropy = entity_entropy.sum(dim=1).cpu().numpy()
 
-            # run model (forward pass)
-            result = model(encodings=batch['encodings'], context_masks=batch['context_masks'],
-                           entity_masks=batch['entity_masks'], entity_sizes=batch['entity_sizes'],
-                           entity_spans=batch['entity_spans'], entity_sample_masks=batch['entity_sample_masks'],
-                           dephead=batch['dephead'], deplabel=batch['deplabel'], pos=batch['pos'], evaluate=True)
-            entity_clf, rel_clf, rels, pooler_output = result
+                    # relation entropy (sigmoid over relation logits)
+                    rel_probs = torch.sigmoid(rel_clf)
+                    rel_entropy = -(rel_probs * torch.log(rel_probs + 1e-12) +
+                                    (1 - rel_probs) * torch.log((1 - rel_probs) + 1e-12))
+                    rel_entropy = rel_entropy.sum(dim=2)
+                    rel_entropy = (rel_entropy * batch['rel_sample_masks'].float()).sum(dim=1).cpu().numpy()
 
-            # evaluate batch
-            pooler_output_all = torch.cat([pooler_output_all, pooler_output], dim=0)
-            torch.save(pooler_output_all[1:, :], 'your/root/path/pooler_output' + Names + '.pt')  # Set your path here
+                    al_entropy_ent.extend(entity_entropy.tolist())
+                    al_entropy_rel.extend(rel_entropy.tolist())
 
-            if rel_clf.shape[1] != 1:
-                s = -1 * rel_clf * torch.log(rel_clf + 1e-12)
-                s = torch.sum(s, dim=2, keepdim=False)
-                a = sorted(s[0, :], key=abs, reverse=True)
-                s = a[0].cpu().numpy()
-            else:
-                s = 0
+                    rel_pred_mask = (torch.sigmoid(rel_clf) >= self.args.rel_filter_threshold).float()
+                    rel_pred_mask = rel_pred_mask * batch['rel_sample_masks'].float().unsqueeze(-1)
+                    label_counts = rel_pred_mask.sum(dim=1).cpu().numpy()
+                    al_label_counts.extend(label_counts.tolist())
 
-            if entity_clf.shape[1] != 1:
-                e = -1 * entity_clf * torch.log(entity_clf + 1e-12)
-                e = torch.sum(e, dim=2, keepdim=False)
-                size = e.shape[1]
-                e = e.sum().item()
-            else:
-                e = 0
+                    al_pooler.extend(pooler_output.cpu().numpy().tolist())
 
-            prediction_entropy_entities = np.vstack((prediction_entropy_entities, e))
-            torch.save(prediction_entropy_entities[1:, :], 'your/root/path/entropy_entities' + Names + '.pt')  # Set your path here
+        global_iteration = epoch * updates_epoch + iteration
+        ner_eval, rel_eval, rel_nec_eval = evaluator.compute_scores()
+        self._log_eval(*ner_eval, *rel_eval, *rel_nec_eval,
+                       epoch, iteration, global_iteration, dataset.label)
 
-            sentence_size = np.vstack((sentence_size, size))
-            torch.save(sentence_size[1:, :], 'your/root/path/sents_size' + Names + '.pt')  # Set your path here
+        if self.args.store_predictions and not self.args.no_overlapping:
+            evaluator.store_predictions()
 
-            prediction_entropy_relation = np.vstack((prediction_entropy_relation, s))
-            torch.save(prediction_entropy_relation[1:, :], 'your/root/path/entropy_relation' + Names + '.pt')  # Set your path here
+        if self.args.store_examples:
+            evaluator.store_examples()
 
-            one = torch.ones_like(rel_clf)
-            zero = torch.zeros_like(rel_clf)
-            prediction_label = torch.where(rel_clf >= 0.4, one, zero)
-            prediction_label_all = np.vstack((prediction_label_all, torch.sum(prediction_label, dim=1, keepdim=False)[0, :].cpu().numpy()))
+        if dump_dir:
+            torch.save(torch.tensor(al_entropy_rel, dtype=torch.float32), dump_dir / 'entropy_relation.pt')
+            torch.save(torch.tensor(al_entropy_ent, dtype=torch.float32), dump_dir / 'entropy_entities.pt')
+            torch.save(torch.tensor(al_label_counts, dtype=torch.float32), dump_dir / 'label_prediction.pt')
+            torch.save(torch.tensor(al_pooler, dtype=torch.float32), dump_dir / 'pooler_output.pt')
 
-            torch.save(prediction_label_all[1:, :], 'your/root/path/labelprediction' + Names + '.pt')  # Set your path here
-
-            evaluator.eval_batch(entity_clf, rel_clf, rels, batch)
-
-    global_iteration = epoch * updates_epoch + iteration
-    ner_eval, rel_eval, rel_nec_eval = evaluator.compute_scores()
-    self._log_eval(*ner_eval, *rel_eval, *rel_nec_eval,
-                   epoch, iteration, global_iteration, dataset.label)
-
-    if self.args.store_predictions and not self.args.no_overlapping:
-        evaluator.store_predictions()
-
-    if self.args.store_examples:
-        evaluator.store_examples()
-
-    return ner_eval[2], rel_eval[2]
-
+        return ner_eval[2], rel_eval[2]
 
     def _get_optimizer_params(self, model):
-        # param_optimizer = list(model.named_parameters())
         param_optimizer = filter(lambda p: p[1].requires_grad, model.named_parameters())
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer_params = [
@@ -389,32 +375,25 @@ def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInpu
 
     def _log_train(self, optimizer: Optimizer, loss: float, epoch: int,
                    iteration: int, global_iteration: int, label: str):
-        # average loss
         avg_loss = loss / self.args.train_batch_size
-        # get current learning rate
         lr = self._get_lr(optimizer)[0]
 
-        # log to tensorboard
         self._log_tensorboard(label, 'loss', loss, global_iteration)
         self._log_tensorboard(label, 'loss_avg', avg_loss, global_iteration)
         self._log_tensorboard(label, 'lr', lr, global_iteration)
 
-        # log to csv
         self._log_csv(label, 'loss', loss, epoch, iteration, global_iteration)
         self._log_csv(label, 'loss_avg', avg_loss, epoch, iteration, global_iteration)
         self._log_csv(label, 'lr', lr, epoch, iteration, global_iteration)
 
     def _log_eval(self, ner_prec_micro: float, ner_rec_micro: float, ner_f1_micro: float,
                   ner_prec_macro: float, ner_rec_macro: float, ner_f1_macro: float,
-
                   rel_prec_micro: float, rel_rec_micro: float, rel_f1_micro: float,
                   rel_prec_macro: float, rel_rec_macro: float, rel_f1_macro: float,
-
                   rel_nec_prec_micro: float, rel_nec_rec_micro: float, rel_nec_f1_micro: float,
                   rel_nec_prec_macro: float, rel_nec_rec_macro: float, rel_nec_f1_macro: float,
                   epoch: int, iteration: int, global_iteration: int, label: str):
 
-        # log to tensorboard
         self._log_tensorboard(label, 'eval/ner_prec_micro', ner_prec_micro, global_iteration)
         self._log_tensorboard(label, 'eval/ner_recall_micro', ner_rec_micro, global_iteration)
         self._log_tensorboard(label, 'eval/ner_f1_micro', ner_f1_micro, global_iteration)
@@ -436,13 +415,10 @@ def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInpu
         self._log_tensorboard(label, 'eval/rel_nec_recall_macro', rel_nec_rec_macro, global_iteration)
         self._log_tensorboard(label, 'eval/rel_nec_f1_macro', rel_nec_f1_macro, global_iteration)
 
-        # log to csv
         self._log_csv(label, 'eval', ner_prec_micro, ner_rec_micro, ner_f1_micro,
                       ner_prec_macro, ner_rec_macro, ner_f1_macro,
-
                       rel_prec_micro, rel_rec_micro, rel_f1_micro,
                       rel_prec_macro, rel_rec_macro, rel_f1_macro,
-
                       rel_nec_prec_micro, rel_nec_rec_micro, rel_nec_f1_micro,
                       rel_nec_prec_macro, rel_nec_rec_macro, rel_nec_f1_macro,
                       epoch, iteration, global_iteration)

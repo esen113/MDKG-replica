@@ -174,7 +174,10 @@ def store_predictions(documents, pred_entities, pred_relations, store_path):
             entity_span = entity[:2]
             span_tokens = util.get_span_tokens(tokens, entity_span)
             entity_type = entity[2].identifier
-            converted_entity = dict(type=entity_type, start=span_tokens[0].index, end=span_tokens[-1].index + 1)
+            converted_entity = dict(type=entity_type,
+                                    start=span_tokens[0].index,
+                                    end=span_tokens[-1].index + 1,
+                                    score=entity[3] if len(entity) > 3 else None)
             converted_entities.append(converted_entity)
         converted_entities = sorted(converted_entities, key=lambda e: e['start'])
 
@@ -196,7 +199,10 @@ def store_predictions(documents, pred_entities, pred_relations, store_path):
             head_idx = converted_entities.index(converted_head)
             tail_idx = converted_entities.index(converted_tail)
 
-            converted_relation = dict(type=relation_type, head=head_idx, tail=tail_idx)
+            converted_relation = dict(type=relation_type,
+                                      head=head_idx,
+                                      tail=tail_idx,
+                                      score=relation[3] if len(relation) > 3 else None)
             converted_relations.append(converted_relation)
         converted_relations = sorted(converted_relations, key=lambda r: r['head'])
 

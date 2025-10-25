@@ -217,14 +217,14 @@ def to_device(batch, device):
 
 def check_version(config, model_class, model_path):
     if os.path.exists(model_path):
-        model_path = model_path if model_path.endswith('.bin') else os.path.join(model_path, 'pytorch_model.bin')
-        state_dict = torch.load(model_path, map_location=torch.device('cpu'))
+        bin_path = model_path if model_path.endswith('.bin') else os.path.join(model_path, 'pytorch_model.bin')
+        if not os.path.exists(bin_path):
+            return
+
+        state_dict = torch.load(bin_path, map_location=torch.device('cpu'))
         config_dict = config.to_dict()
 
-        # version check
-        #DKS: We expect to work with Syntax-BERT based model. Its version is 1.0.
-        #Config file contains 'syn_spert_version=1.2'
-        loaded_version = config_dict.get('syn_spert_version', '1.0')  #2nd argument is the default value.
+        loaded_version = config_dict.get('syn_spert_version', '1.0')
         if 'rel_classifier.weight' in state_dict and loaded_version != model_class.VERSION:
             msg = ("Current SpERT version (%s) does not match the version of the loaded model (%s). "
                    % (model_class.VERSION, loaded_version))

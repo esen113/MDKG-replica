@@ -1,82 +1,192 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Jul 10 13:04:56 2021
-
-@author: DS
-"""
-
+import argparse
+from pathlib import Path
 
 import Runner
-BASE_DIR=r"../InputsAndOutputs/"
 
-BERT_PATH = BASE_DIR+"pretrained/CODER"
-TOKENIZER_PATH= BERT_PATH
-MODEL_TYPE="syn_spert"
-CONFIG_PATH= BASE_DIR + "configs/config-coder.json"
 
-LOG_PATH=  BASE_DIR + "data/log/"
-SAVE_PATH= BASE_DIR + "data/save/"
-CACHE_PATH= BASE_DIR + "data/cache/"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE_DIR = (Path(__file__).resolve().parent / "../InputsAndOutputs").resolve()
+DATA_DIR = BASE_DIR / "data" / "datasets"
 
-# Paths to data files for training, validation, and testing
-TRAIN_PATH = "your/train/path/md_train_KG_0217_1_agu_new.json"  # Set your train file path here
-VALID_PATH = "your/valid/path/md_test_KG_0217_1_agu_new.json"  # Set your validation file path here
-TYPES_PATH = BASE_DIR + "data/datasets/DPKG_types_Cor4.json"  # Set your types file path here (BASE_DIR should be defined)
-TEST_PATH = "your/test/path/md_test_KG_0216_agu.json"  # Set your test file path here
+BERT_MODEL = "bert-base-uncased"
+MODEL_TYPE = "syn_spert"
 
-#==============================================================
-TRAIN = True
-# TRAIN = False
-#False ##for evaluation
-#==============================================================
-MODEL_PATH = SAVE_PATH + "best_model600_0216_1"
-#==============================================================
-SEED=11
-unlable_feat = []
-USE_POS='--use_pos' 
-USE_ENTITY_CLF='logits'     #Choices: none, logits, softmax, onehot
+LOG_PATH = (BASE_DIR / "data" / "log").resolve()
+SAVE_PATH = (BASE_DIR / "data" / "save").resolve()
+CACHE_PATH = (BASE_DIR / "data" / "cache").resolve()
 
-if __name__ == "__main__": 
-    if TRAIN==True:  
-      input_args_list = f"train --model_type {MODEL_TYPE} --label 'scierc_train' \
-        --model_path  {BERT_PATH} --tokenizer_path  {BERT_PATH} \
-        --train_path  {TRAIN_PATH} --valid_path {VALID_PATH} \
-        --types_path {TYPES_PATH} --cache_path  {CACHE_PATH} \
-        --size_embedding 25 --train_batch_size 1 \
-        --use_pos true --pos_embedding 25 \
-        --use_entity_clf {USE_ENTITY_CLF} \
-        --eval_batch_size 1 --epochs 30 --lr 5e-5 --lr_warmup 0.1 \
-        --weight_decay 0.01 --max_grad_norm 1.0 --prop_drop 0.1 \
-        --neg_entity_count 100 --neg_relation_count 100 \
-        --max_span_size 10 --rel_filter_threshold 0.4 --max_pairs 1000 \
-        --sampling_processes 4 --sampling_limit 100  \
-        --store_predictions True --store_examples True \
-        --log_path  {LOG_PATH} --save_path {SAVE_PATH} \
-        --max_seq_length 512 --config_path  {CONFIG_PATH}  --Names {names} \
-        --gradient_accumulation_steps 1 --wordpiece_aligned_dep_graph --seed {SEED} "
+TRAIN_PATH = (DATA_DIR / "diabetes_train.json").resolve()
+VALID_PATH = (DATA_DIR / "diabetes_valid.json").resolve()
+TEST_PATH = (DATA_DIR / "diabetes_test.json").resolve()
+TYPES_PATH = (REPO_ROOT / "nutrition_diabetes_types.json").resolve()
 
+RUN_LABEL = "diabetes_small_run"
+SEED = 11
+
+
+def ensure_directories():
+    for path in [LOG_PATH, SAVE_PATH, CACHE_PATH]:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def build_train_args() -> list:
+    return [
+        "train",
+        "--model_type",
+        MODEL_TYPE,
+        "--label",
+        RUN_LABEL,
+        "--model_path",
+        BERT_MODEL,
+        "--tokenizer_path",
+        BERT_MODEL,
+        "--train_path",
+        str(TRAIN_PATH),
+        "--valid_path",
+        str(VALID_PATH),
+        "--types_path",
+        str(TYPES_PATH),
+        "--cache_path",
+        str(CACHE_PATH),
+        "--size_embedding",
+        "25",
+        "--train_batch_size",
+        "2",
+        "--use_pos",
+        "--pos_embedding",
+        "25",
+        "--use_entity_clf",
+        "logits",
+        "--eval_batch_size",
+        "2",
+        "--epochs",
+        "5",
+        "--lr",
+        "5e-5",
+        "--lr_warmup",
+        "0.1",
+        "--weight_decay",
+        "0.01",
+        "--max_grad_norm",
+        "1.0",
+        "--prop_drop",
+        "0.1",
+        "--neg_entity_count",
+        "20",
+        "--neg_relation_count",
+        "20",
+        "--max_span_size",
+        "10",
+        "--rel_filter_threshold",
+        "0.4",
+        "--max_pairs",
+        "1000",
+        "--sampling_processes",
+        "0",
+        "--sampling_limit",
+        "100",
+        "--store_predictions",
+        "--store_examples",
+        "--skip_eval",
+        "--log_path",
+        str(LOG_PATH),
+        "--save_path",
+        str(SAVE_PATH),
+        "--max_seq_length",
+        "512",
+        "--config_path",
+        BERT_MODEL,
+        "--seed",
+        str(SEED),
+    ]
+
+
+def build_eval_args(model_dir: Path) -> list:
+    return [
+        "eval",
+        "--model_type",
+        MODEL_TYPE,
+        "--label",
+        f"{RUN_LABEL}_eval",
+        "--model_path",
+        str(model_dir),
+        "--tokenizer_path",
+        str(model_dir),
+        "--dataset_path",
+        str(TEST_PATH),
+        "--types_path",
+        str(TYPES_PATH),
+        "--cache_path",
+        str(CACHE_PATH),
+        "--size_embedding",
+        "25",
+        "--use_pos",
+        "--pos_embedding",
+        "25",
+        "--use_entity_clf",
+        "logits",
+        "--eval_batch_size",
+        "2",
+        "--lr",
+        "5e-5",
+        "--lr_warmup",
+        "0.1",
+        "--weight_decay",
+        "0.01",
+        "--max_grad_norm",
+        "1.0",
+        "--prop_drop",
+        "0.1",
+        "--max_span_size",
+        "10",
+        "--rel_filter_threshold",
+        "0.4",
+        "--max_pairs",
+        "1000",
+        "--sampling_processes",
+        "0",
+        "--sampling_limit",
+        "100",
+        "--store_predictions",
+        "--store_examples",
+        "--log_path",
+        str(LOG_PATH),
+        "--save_path",
+        str(SAVE_PATH),
+        "--max_seq_length",
+        "512",
+        "--config_path",
+        BERT_MODEL,
+        "--seed",
+        str(SEED),
+    ]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Utility entrypoint for SynSpERT experiments.")
+    parser.add_argument("--mode", choices=["train", "eval"], default="train")
+    parser.add_argument(
+        "--model_dir",
+        type=Path,
+        default=SAVE_PATH,
+        help="Model directory to use when running in eval mode.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ensure_directories()
+
+    if args.mode == "train":
+        run_args = build_train_args()
     else:
-        input_args_list = f"eval --model_type {MODEL_TYPE} --label 'scierc_eval' \
-          --model_path  {MODEL_PATH} --tokenizer_path {MODEL_PATH} \
-          --dataset_path {TEST_PATH}  \
-          --types_path  {TYPES_PATH}  --cache_path {CACHE_PATH} \
-          --size_embedding 25 \
-           {USE_POS} --pos_embedding 25 \
-          --use_entity_clf {USE_ENTITY_CLF} \
-          --eval_batch_size 1  --lr 5e-5 --lr_warmup 0.1 \
-          --weight_decay 0.01 --max_grad_norm 1.0 --prop_drop 0.1 \
-          --max_span_size 10 --rel_filter_threshold 0.4 --max_pairs 1000 \
-          --sampling_processes 4 --sampling_limit 100 \
-          --store_predictions True --store_examples True \
-          --log_path {LOG_PATH} --save_path {SAVE_PATH} \
-          --max_seq_length 512 --config_path {CONFIG_PATH} \
-          --gradient_accumulation_steps 1  --wordpiece_aligned_dep_graph --seed {SEED}" #\
-#          --no_overlapping"
-        
-    print("*** Commandline: ", input_args_list)
+        run_args = build_eval_args(args.model_dir)
 
-    input_args_list = input_args_list.split() 
-    #print(input_args_list)
-    r = Runner.Runner()
-    r.run(input_args_list)
+    print("*** Commandline:", " ".join(run_args))
+    runner = Runner.Runner()
+    runner.run(run_args)
 
+
+if __name__ == "__main__":
+    main()

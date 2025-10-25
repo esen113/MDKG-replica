@@ -2,8 +2,6 @@ from collections import OrderedDict
 from typing import List
 from torch.utils.data import Dataset as TorchDataset
 
-from spert import sampling
-
 
 class RelationType:
     def __init__(self, identifier, index, short_name, verbose_name, symmetric=False):
@@ -428,11 +426,13 @@ class Dataset(TorchDataset):
 
         #print("DKS: ===============> Dataset::__getitem__ called.")
         if self._mode == Dataset.TRAIN_MODE:
+            from spert import sampling
             #print("DKS: ===============> Dataset::__getitem__ called ===> sampling.create_train_sample")
 
             return sampling.create_train_sample(doc, self._neg_entity_count, self._neg_rel_count,
                                                 self._max_span_size, len(self._rel_types))
         else:
+            from spert import sampling
             return sampling.create_eval_sample(doc, self._max_span_size)
 
     def switch_mode(self, mode):
