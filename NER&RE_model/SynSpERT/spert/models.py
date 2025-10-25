@@ -388,11 +388,15 @@ class SynSpERT(SpERT):
                                 entity_masks, size_embeddings, pos, hlarge1)
 
         # ignore entity candidates that do not constitute an actual entity for relations (based on classifier)
-        relations, rel_masks, rel_sample_masks = self._filter_spans(entity_clf, entity_spans,
-                                                                    entity_sample_masks, 
-                                                                    ctx_size)
+        relations, rel_masks, rel_sample_masks = self._filter_spans(
+            entity_clf,
+            entity_spans,
+            entity_sample_masks,
+            ctx_size,
+        )
 
-        rel_sample_masks = rel_sample_masks.float().unsqueeze(-1)
+        rel_sample_masks_bool = rel_sample_masks
+        rel_sample_masks = rel_sample_masks_bool.float().unsqueeze(-1)
         h_large = h.unsqueeze(1).repeat(1, max(min(relations.shape[1], self._max_pairs), 1), 1, 1)
         hlarge2 = None
         if (self._use_pos):
@@ -418,7 +422,7 @@ class SynSpERT(SpERT):
         # apply softmax
         entity_clf = torch.softmax(entity_clf, dim=2)
 
-        return entity_clf, rel_clf, relations, h_pooler
+        return entity_clf, rel_clf, relations, h_pooler, rel_sample_masks_bool
 
 # Model access
 
