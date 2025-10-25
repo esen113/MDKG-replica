@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 
 import faiss
 import numpy as np
@@ -32,6 +33,22 @@ def load_tensors(dump_dir: Path):
     label_prediction = torch.load(dump_dir / "label_prediction.pt", map_location="cpu").float()
     pooler_output = torch.load(dump_dir / "pooler_output.pt", map_location="cpu").float()
     return entropy_relation, entropy_entities, label_prediction, pooler_output
+
+
+def detokenize(tokens: list[str]) -> str:
+    words = []
+    for tok in tokens:
+        if tok.startswith("##") and words:
+            words[-1] += tok[2:]
+        else:
+            words.append(tok)
+
+    text = " ".join(words)
+    text = re.sub(r"\s+([.,;:!?%)\]}])", r"\1", text)
+    text = re.sub(r"([({\[])\s+", r"\1", text)
+    text = re.sub(r"\s+'", "'", text)
+    text = re.sub(r"'\s+", "'", text)
+    return text
 
 
 def main():
@@ -122,6 +139,17 @@ def main():
     with open(dump_dir / f"sampling_json_{prefix}.json", "w") as fw:
         json.dump(sampled_docs, fw)
 
+    readable_sentences = []
+    for doc in sampled_docs:
+        sentence = detokenize(doc.get("tokens", []))
+        orig_id = doc.get("orig_id", "")
+        readable_sentences.append((orig_id, sentence))
+
+    with open(dump_dir / f"sampling_text_{prefix}.txt", "w") as fw:
+        for orig_id, sentence in readable_sentences:
+            line = f"{orig_id}\t{sentence}" if orig_id else sentence
+            fw.write(line + "\n")
 
 if __name__ == "__main__":
     main()
+
