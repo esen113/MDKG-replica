@@ -313,7 +313,7 @@ class SpERTTrainer(BaseTrainer):
             total = math.ceil(dataset.document_count / self.args.eval_batch_size)
             for batch in tqdm(data_loader, total=total, desc='Evaluate epoch %s' % epoch):
                 batch = util.to_device(batch, self._device)
-                entity_clf, rel_clf, rels, pooler_output = model(
+                entity_clf, rel_clf, rels, pooler_output, rel_sample_masks = model(
                     encodings=batch['encodings'], context_masks=batch['context_masks'],
                     entity_masks=batch['entity_masks'], entity_sizes=batch['entity_sizes'],
                     entity_spans=batch['entity_spans'], entity_sample_masks=batch['entity_sample_masks'],
@@ -332,13 +332,13 @@ class SpERTTrainer(BaseTrainer):
                     rel_entropy = -(rel_probs * torch.log(rel_probs + 1e-12) +
                                     (1 - rel_probs) * torch.log((1 - rel_probs) + 1e-12))
                     rel_entropy = rel_entropy.sum(dim=2)
-                    rel_entropy = (rel_entropy * batch['rel_sample_masks'].float()).sum(dim=1).cpu().numpy()
+                    rel_entropy = (rel_entropy * rel_sample_masks.float()).sum(dim=1).cpu().numpy()
 
                     al_entropy_ent.extend(entity_entropy.tolist())
                     al_entropy_rel.extend(rel_entropy.tolist())
 
                     rel_pred_mask = (torch.sigmoid(rel_clf) >= self.args.rel_filter_threshold).float()
-                    rel_pred_mask = rel_pred_mask * batch['rel_sample_masks'].float().unsqueeze(-1)
+                    rel_pred_mask = rel_pred_mask * rel_sample_masks.float().unsqueeze(-1)
                     label_counts = rel_pred_mask.sum(dim=1).cpu().numpy()
                     al_label_counts.extend(label_counts.tolist())
 
