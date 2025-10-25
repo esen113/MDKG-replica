@@ -1,0 +1,60 @@
+{
+    "entities": {
+        "nutrition": {
+            "short": "Nutri",
+            "verbose": "nutrition"
+        },
+        "diabetes": {
+            "short": "Diab",
+            "verbose": "diabetes"
+        },
+        "other_disease_symptom": {
+            "short": "OthDisSym",
+            "verbose": "other_disease_symptom"
+        },
+        "chemical": {
+            "short": "Chem",
+            "verbose": "chemical"
+        },
+        "gene_protein": {
+            "short": "GenPro",
+            "verbose": "gene_protein"
+        },
+        "population": {
+            "short": "Pop",
+            "verbose": "population"
+        }
+    },
+    "relations": {
+        "is_risk_factor_of": {
+            "short": "risk_of",
+            "verbose": "is_risk_factor_of",
+            "symmetric": false
+        },
+        "is_diagnostic_for": {
+            "short": "diag_for",
+            "verbose": "is_diagnostic_for",
+            "symmetric": false
+        },
+        "is_characteristic_of": {
+            "short": "char_of",
+            "verbose": "is_characteristic_of",
+            "symmetric": false
+        },
+        "association_with": {
+            "short": "assoc_with",
+            "verbose": "association_with",
+            "symmetric": false
+        },
+        "treats": {
+            "short": "treats",
+            "verbose": "treats",
+            "symmetric": false
+        },
+        "is_a": {
+            "short": "is_a",
+            "verbose": "is_a",
+            "symmetric": false
+        }
+    }
+}
