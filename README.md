@@ -1,27 +1,35 @@
 # SynSpERT.PL Training & Active Learning Guide
 
-This repository contains a lightly modified copy of the MDKG SynSpERT.PL codebase plus support scripts to train on custom data and run an active learning loop.  
-The notes below focus on two workflows:
+This repository packages a lightly modified copy of the MDKG SynSpERT.PL codebase together with tooling to:
 
-1. Train / evaluate SynSpERT on your dataset.
-2. Produce uncertainty features and drive the adaptive sampling script.
+1. Prepare MDIEC- / MDERC-style data for SynSpERT.
+2. Train / evaluate the joint NER & RE model on top of arbitrary BERT-family backbones.
+3. Run the entropy/diversity-based active learning loop.
 
-All paths are relative to the repository root.
+All commands below assume the repository root (`/Users/<user>/MDKG-replica-3`) as the working directory unless stated otherwise.
 
 ---
 
-## 1. Environment
+## 1. Environment (once)
 
 ```bash
-# create (once)
-conda create -n mdkgspert python=3.10 pytorch torchvision torchaudio cpuonly -c pytorch -c conda-forge
-conda install -n mdkgspert scikit-learn transformers tqdm numpy scipy more-itertools faiss-cpu -c conda-forge
+conda create -n mdkgspert python=3.10 -y
+conda run -n mdkgspert pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+conda run -n mdkgspert pip install scikit-learn transformers tqdm numpy scipy \
+  more-itertools faiss-cpu spacy scispacy huggingface-hub nltk
+conda run -n mdkgspert python -m spacy download en_core_web_sm
+conda run -n mdkgspert python -m spacy download en_core_sci_sm
+conda run -n mdkgspert python -m nltk.downloader punkt punkt_tab
+huggingface-cli login    # required for auto-downloading Hugging Face models
+```
 
-# activate (every session)
+Activate the environment for every new shell:
+
+```bash
 conda activate mdkgspert
 ```
 
-The commands below assume the environment is active. On macOS you may also want to pin OpenMP vars to avoid shared-memory errors:
+Optional (macOS CPU) to avoid OpenMP oversubscription:
 
 ```bash
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
@@ -30,107 +38,146 @@ export KMP_AFFINITY=disabled KMP_INIT_AT_FORK=FALSE KMP_DUPLICATE_LIB_OK=TRUE
 
 ---
 
-## 2. Data preparation
+## 2. Dataset preparation
 
-Place your annotated documents in the root (e.g. `spert_training_data_10.json`) and run:
+### 2.1 Fetch official MDIEC annotations
 
 ```bash
-python NER&RE_model/SynSpERT/generate_augmented_input.py \
-  --input spert_training_data_10.json \
-  --output_dir NER&RE_model/InputsAndOutputs/data/datasets \
-  --prefix diabetes --seed 13
+python scripts/fetch_official_data.py --overwrite
 ```
 
-This creates `diabetes_{train,valid,test,all}.json` and augments each document with POS / dependency features.  
-If SciSpaCy is installed it is used, otherwise a rule-based fallback kicks in.
+The script pulls `data/MDIEC.zip` from `YF0808/MDKG_data` on Hugging Face and extracts into `NER&RE_model/InputsAndOutputs/data/dataset/MDIEC/`.
 
----
+> Already downloaded data? Place your `.ann/.txt` pairs directly under `NER&RE_model/InputsAndOutputs/data/dataset/<folder>/`.
 
-## 3. Train the model
+### 2.2 Convert Brat annotations to SynSpERT JSON
 
 ```bash
-python NER&RE_model/SynSpERT/main.py --mode train
+python 'NER&RE_model/SynSpERT/generate_input.py' \
+  --input_dir 'NER&RE_model/InputsAndOutputs/data/dataset/MDIEC' \
+  --output_json 'NER&RE_model/InputsAndOutputs/data/dataset/MDIEC.json'
 ```
 
-Key notes:
+This aggregates all documents into a single JSON file with SynSpERT’s expected schema (tokens, entities, relations, `orig_id`, …).
 
-- Uses `bert-base-uncased` by default.
-- Training data: `InputsAndOutputs/data/datasets/diabetes_{train,valid}.json`.
-- Checkpoints land in `InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model/`.
-- Logs (loss, args) appear in `InputsAndOutputs/data/log/diabetes_small_run/<timestamp>/`.
-- Validation is skipped by default (`--skip_eval` in `main.py`) to sidestep OpenMP issues; remove the flag if you need per-epoch dev metrics.
-
----
-
-## 4. Evaluate / prediction dump
+### 2.3 Generate augmented train/valid/test splits
 
 ```bash
-python NER&RE_model/SynSpERT/main.py \
-  --mode eval \
-  --model_dir NER&RE_model/InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model
+python 'NER&RE_model/SynSpERT/generate_augmented_input.py' \
+  --input 'NER&RE_model/InputsAndOutputs/data/dataset/MDIEC.json' \
+  --output_dir 'NER&RE_model/InputsAndOutputs/data/datasets' \
+  --prefix diabetes \
+  --seed 13
 ```
 
 Outputs:
+- `NER&RE_model/InputsAndOutputs/data/datasets/diabetes_{train,valid,test,all}.json`
+- Each document augmented with POS, dependency labels, heads, and verb indicators (SciSpaCy when available, rule-based fallback otherwise).
 
-- Metrics (`eval_test.csv`) and HTML examples at `InputsAndOutputs/data/log/diabetes_small_run_eval/<timestamp>/`.
-- `predictions_test_epoch_0.json` includes tokens, entities, relations, and softmax scores.
+> `nutrition_diabetes_types.json` now mirrors MDIEC’s ontology (9 entity types, 8 relation types). Update this file if you introduce other datasets.
 
-You can override `--dataset_path` to score any JSON file that follows the SynSpERT schema.
+---
+
+## 3. Training
+
+The training entrypoint supports both local checkpoints and Hugging Face model IDs. Key CLI flags:
+
+- `--bert_model`: model name or local path (default `bert-base-uncased`)
+- `--config_override`: optional SynSpERT config JSON (otherwise the model directory/config is reused)
+- `--download_dir`: cache location for downloaded Hugging Face models (defaults to `NER&RE_model/InputsAndOutputs/models`)
+- `--run_seed`: overrides the run seed used in logs/checkpoint names
+
+### Example: CODER++
+
+```bash
+python 'NER&RE_model/SynSpERT/main.py' --mode train \
+  --bert_model GanjinZero/coder_eng_pp \
+  --config_override 'NER&RE_model/SynSpERT/configs/config-coder.json' \
+  --download_dir 'NER&RE_model/InputsAndOutputs/models' \
+  --run_seed 11
+```
+
+### Other backbone examples
+
+```bash
+# PubMedBERT (uncased)
+python 'NER&RE_model/SynSpERT/main.py' --mode train \
+  --bert_model microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext \
+  --config_override 'NER&RE_model/SynSpERT/configs/config.json' \
+  --download_dir 'NER&RE_model/InputsAndOutputs/models' \
+  --run_seed 13
+
+# BioBERT (cased)
+python 'NER&RE_model/SynSpERT/main.py' --mode train \
+  --bert_model dmis-lab/biobert-base-cased-v1.1 \
+  --config_override 'NER&RE_model/SynSpERT/configs/config-biobert.json' \
+  --download_dir 'NER&RE_model/InputsAndOutputs/models' \
+  --run_seed 13
+```
+
+Outputs (per run label, default `diabetes_small_run`):
+
+- Checkpoints: `NER&RE_model/InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model/`
+- Logs & predictions: `NER&RE_model/InputsAndOutputs/data/log/diabetes_small_run/<timestamp>/`
+- Validation is skipped by default to avoid OpenMP contention (`--skip_eval` baked into default args). Remove the flag inside `main.py` if per-epoch validation is needed.
+
+---
+
+## 4. Evaluation & prediction dumps
+
+```bash
+python 'NER&RE_model/SynSpERT/main.py' --mode eval \
+  --model_dir 'NER&RE_model/InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model' \
+  --bert_model GanjinZero/coder_eng_pp \
+  --config_override 'NER&RE_model/SynSpERT/configs/config-coder.json' \
+  --download_dir 'NER&RE_model/InputsAndOutputs/models' \
+  --dataset_path 'NER&RE_model/InputsAndOutputs/data/datasets/diabetes_test.json' \
+  --label coderpp_eval \
+  --store_predictions
+```
+
+Evaluation artifacts:
+
+- `eval_test.csv`, HTML entity/relation tables under `.../data/log/<label>/<timestamp>/`
+- `predictions_test_epoch_0.json` with tokens/entities/relations/scores
+- Optional active-learning tensors when `--al_dump_dir` is provided (see next section)
+
+`--dataset_path` can point to any compatible JSON (e.g., unlabeled pool).
 
 ---
 
 ## 5. Active learning workflow
 
-1. **Prepare an unlabeled pool**  
-   Build a JSON `diabetes_unlabeled.json` with the same schema as the SynSpERT training data (`relations` can be empty).
-
-2. **Run “uncertainty inference”**  
+1. **Prepare unlabeled pool** – JSON with SynSpERT schema (relations may be empty).
+2. **Uncertainty inference**:
    ```bash
-   python NER&RE_model/SynSpERT/main.py \
-     --mode eval \
+   python 'NER&RE_model/SynSpERT/main.py' --mode eval \
      --dataset_path diabetes_unlabeled.json \
-     --model_dir NER&RE_model/InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model \
+     --model_dir 'NER&RE_model/InputsAndOutputs/data/save/diabetes_small_run/<timestamp>/final_model' \
      --al_dump_dir Outputs/al_round_01 \
      --label diabetes_al_round01 \
+     --bert_model GanjinZero/coder_eng_pp \
+     --config_override 'NER&RE_model/SynSpERT/configs/config-coder.json' \
+     --download_dir 'NER&RE_model/InputsAndOutputs/models' \
      --store_predictions
    ```
-   The flag `--al_dump_dir` triggers dumps of:
-   - `entropy_entities.pt`
-   - `entropy_relation.pt`
-   - `label_prediction.pt`
-   - `pooler_output.pt`
+   Generates entropy tensors (`entropy_entities.pt`, `entropy_relation.pt`, `label_prediction.pt`, `pooler_output.pt`) under `Outputs/al_round_01/`.
 
-3. **Select samples**  
+3. **Sample selection**:
    ```bash
    python Active_learning.py \
      --dump_dir Outputs/al_round_01 \
      --unlabeled_json diabetes_unlabeled.json \
      --output_prefix round01 \
-     --top_k 20 --sample_per_group 10 --beta 0.1 --gamma 0.1 --ncentroids 20 --use_weights
+     --top_k 20 --sample_per_group 10 --beta 0.1 --gamma 0.1 \
+     --ncentroids 20 --use_weights
    ```
-   This produces:
-   - `sampling_json_round01.json` – documents to send for annotation.
-   - `sampling_text_round01.txt` – detokenized sentences for quick review.
-   - `selected_indices_round01.pt` – indices of chosen items.
-   - Optional analytic files (`weighted_embedding_*.pt`, `class_number_*.pt`).
+   Produces:
+   - `sampling_json_round01.json` (documents to annotate)
+   - `sampling_text_round01.txt` (detokenised sentences)
+   - `selected_indices_round01.pt` (+ optional analytics)
 
-4. **Annotate & refresh training data**  
-   1. Apply any manual fixes in `sampling_json_round01.json`.
-   2. Merge the revised documents back into `spert_training_data_10.json`.
-   3. Regenerate train/valid/test splits:
-      ```bash
-      python NER&RE_model/SynSpERT/generate_augmented_input.py \
-        --input spert_training_data_10.json \
-        --output_dir NER&RE_model/InputsAndOutputs/data/datasets \
-        --prefix diabetes \
-        --seed 13
-      ```
-   4. Retrain:
-      ```bash
-      python NER&RE_model/SynSpERT/main.py --mode train
-      ```
-
-Repeat the cycle until budget is exhausted or performance converges.
+4. **Annotate & refresh** – merge annotated items back into the training JSON, rerun §2.3 and §3, repeat until convergence/budget exhaustion.
 
 ---
 
@@ -138,15 +185,15 @@ Repeat the cycle until budget is exhausted or performance converges.
 
 | Path / Script | Purpose |
 |---------------|---------|
-| `NER&RE_model/SynSpERT/generate_augmented_input.py` | Token-level augmentation & train/valid/test split |
-| `NER&RE_model/SynSpERT/main.py` | Unified CLI for training (`--mode train`) and evaluation (`--mode eval`) |
-| `NER&RE_model/SynSpERT/spert/spert_trainer.py` | Core training loop; `_eval` emits AL features when `--al_dump_dir` is set |
-| `Active_learning.py` | Entropy + diversity sampler that produces JSON for manual labeling |
-| `NER&RE_model/InputsAndOutputs/data/log/*` | Training / evaluation logs, predictions, metrics |
-| `NER&RE_model/InputsAndOutputs/data/save/*` | Saved transformers models (config + weights) |
+| `scripts/fetch_official_data.py` | Pull MDIEC zip from Hugging Face and extract locally |
+| `NER&RE_model/SynSpERT/generate_input.py` | Convert `.ann/.txt` directories to SynSpERT JSON |
+| `NER&RE_model/SynSpERT/generate_augmented_input.py` | Add linguistic features & produce train/valid/test splits |
+| `NER&RE_model/SynSpERT/main.py` | Unified CLI for training (`--mode train`) and evaluation (`--mode eval`) with backbone selection |
+| `NER&RE_model/SynSpERT/spert/spert_trainer.py` | Training loop; emits AL tensors when `--al_dump_dir` is set |
+| `Active_learning.py` | Entropy + diversity sampler used during annotation rounds |
+| `NER&RE_model/InputsAndOutputs/data/log/*` | Training/evaluation logs, metrics, HTML previews |
+| `NER&RE_model/InputsAndOutputs/data/save/*` | Saved checkpoints (`config.json`, `pytorch_model.bin`, `tokenizer.*`, etc.) |
 
 ---
 
-Feel free to adapt the hyper-parameters or sampling strategy. The current defaults prioritise getting a CPU-only pipeline running end-to-end with minimal manual tweaks.  
-If you add new AL rounds, consider versioning the output directories (`al_round_02`, `al_round_03`, …) for easy tracking.
-
+Feel free to tweak hyperparameters, backbone choices, or sampling heuristics. The current defaults prioritise a CPU-friendly end-to-end reproduction path using MDIEC + CODER++, while keeping the pipeline extensible for future datasets. Continuous active-learning rounds are recommended to be versioned (`al_round_01`, `al_round_02`, …) for clarity.***

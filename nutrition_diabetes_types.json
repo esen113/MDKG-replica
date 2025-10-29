@@ -1,60 +1,82 @@
 {
-    "entities": {
-        "nutrition": {
-            "short": "Nutri",
-            "verbose": "nutrition"
-        },
-        "diabetes": {
-            "short": "Diab",
-            "verbose": "diabetes"
-        },
-        "other_disease_symptom": {
-            "short": "OthDisSym",
-            "verbose": "other_disease_symptom"
-        },
-        "chemical": {
-            "short": "Chem",
-            "verbose": "chemical"
-        },
-        "gene_protein": {
-            "short": "GenPro",
-            "verbose": "gene_protein"
-        },
-        "population": {
-            "short": "Pop",
-            "verbose": "population"
-        }
+  "entities": {
+    "disease": {
+      "short": "Disease",
+      "verbose": "disease"
     },
-    "relations": {
-        "is_risk_factor_of": {
-            "short": "risk_of",
-            "verbose": "is_risk_factor_of",
-            "symmetric": false
-        },
-        "is_diagnostic_for": {
-            "short": "diag_for",
-            "verbose": "is_diagnostic_for",
-            "symmetric": false
-        },
-        "is_characteristic_of": {
-            "short": "char_of",
-            "verbose": "is_characteristic_of",
-            "symmetric": false
-        },
-        "association_with": {
-            "short": "assoc_with",
-            "verbose": "association_with",
-            "symmetric": false
-        },
-        "treats": {
-            "short": "treats",
-            "verbose": "treats",
-            "symmetric": false
-        },
-        "is_a": {
-            "short": "is_a",
-            "verbose": "is_a",
-            "symmetric": false
-        }
+    "method": {
+      "short": "Method",
+      "verbose": "method"
+    },
+    "Health_factors": {
+      "short": "HealthFactor",
+      "verbose": "health_factor"
+    },
+    "drug": {
+      "short": "Drug",
+      "verbose": "drug"
+    },
+    "physiology": {
+      "short": "Physiology",
+      "verbose": "physiology"
+    },
+    "gene": {
+      "short": "Gene",
+      "verbose": "gene"
+    },
+    "region": {
+      "short": "Region",
+      "verbose": "region"
+    },
+    "signs": {
+      "short": "Signs",
+      "verbose": "signs"
+    },
+    "symptom": {
+      "short": "Symptom",
+      "verbose": "symptom"
     }
+  },
+  "relations": {
+    "associated_with": {
+      "short": "assoc_with",
+      "verbose": "associated_with",
+      "symmetric": false
+    },
+    "occurs_in": {
+      "short": "occurs_in",
+      "verbose": "occurs_in",
+      "symmetric": false
+    },
+    "treatment_for": {
+      "short": "treat_for",
+      "verbose": "treatment_for",
+      "symmetric": false
+    },
+    "risk_factor_of": {
+      "short": "risk_factor",
+      "verbose": "risk_factor_of",
+      "symmetric": false
+    },
+    "abbreviation_for": {
+      "short": "abbr_for",
+      "verbose": "abbreviation_for",
+      "symmetric": false
+    },
+    "characteristic_of": {
+      "short": "char_of",
+      "verbose": "characteristic_of",
+      "symmetric": false
+    },
+    "help_diagnose": {
+      "short": "help_diag",
+      "verbose": "help_diagnose",
+      "symmetric": false
+    },
+    "located_in": {
+      "short": "located_in",
+      "verbose": "located_in",
+      "symmetric": false
+    }
+  }
 }

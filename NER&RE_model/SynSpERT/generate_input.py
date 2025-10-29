@@ -1,89 +1,87 @@
-from glob import glob
+"""
+Convert raw Brat-style annotations into a single SynSpERT-compatible JSON file.
+
+Example usage (from repository root):
+
+    python 'NER&RE_model/SynSpERT/generate_input.py' \
+        --input_dir 'NER&RE_model/InputsAndOutputs/data/dataset/MDIEC' \
+        --output_json 'NER&RE_model/InputsAndOutputs/data/dataset/MDIEC.json'
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
-from ann2json_22 import Annotation
-import os
+from pathlib import Path
 
-epoch = 3  # Number of epochs for training
-date = '0217_1'  # Date or version identifier for the dataset
+import nltk
 
-# Paths to data files
-annotated_file_path = r"your/annotated/data/path/"  # Set your annotated data path here
-train_file_path = r'your/train/file/path/md_train_KG_' + date + '.json'  # Set your train file path here
-test_file_path = r'your/test/file/path/md_test_KG_' + date + '.json'  # Set your test file path here
-all_file_path = r'your/all/file/path/md_KG_all_' + date + '.json'  # Set your all data file path here
+from ann2json_updated import Annotation
 
 
-def replace_quotes_in_files(directory):
-    for filename in os.listdir(directory):
-        if filename.endswith('.txt'):
-            filepath = os.path.join(directory, filename)
-
-            with open(filepath, 'r', encoding='utf8') as file:
-                lines = file.readlines()
-
-
-            lines = [line.replace('"', "'") for line in lines]
-
-            with open(filepath, 'w', encoding='utf8') as file:
-                file.writelines(lines)
-
-replace_quotes_in_files(annotated_file_path)
-
-files = glob(annotated_file_path+'*')
-ids = [f.split('\\')[-1].split('.')[0] for f in files]
-
-for id in ids:
-    ann = Annotation(annotated_file_path, id)
-    ann.to_json()
-files = sorted(glob(annotated_file_path+"*.json"))
+def ensure_nltk_punkt() -> None:
+    """Ensure the Punkt tokenizer required by ann2json is available."""
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt")
 
 
-data = list()
-for f in files:
-    data_ = json.load(open(f, 'r'))
-    for d in data_:
-        data.append(d)       
+def convert_directory(input_dir: Path) -> list[dict]:
+    """Load all .ann/.txt files within input_dir into SynSpERT JSON docs."""
+    docs: list[dict] = []
+    ann_files = sorted(input_dir.glob("*.ann"))
+
+    if not ann_files:
+        raise FileNotFoundError(f"No .ann files found in {input_dir}")
+
+    for ann_path in ann_files:
+        pmid = ann_path.stem
+        annotation = Annotation(str(input_dir), pmid)
+        sentences = annotation.obtain_annotations()
+        for idx, sent in enumerate(sentences):
+            sent["orig_id"] = f"{pmid}_{idx}"
+            docs.append(sent)
+
+    return docs
 
 
-from sklearn.model_selection import train_test_split
-
-import collections
-ys = [x['relations'][0]['type'] if len(x['relations'])>0 else 'no_relation' for x in data]
-counter=collections.Counter(ys)
-print(counter)
-
-xs = [x['relations'][0]['type'] if len(x['relations'])>0 else 'no_relation' for x in data]
-counter=collections.Counter(ys)
-
-token = []
-for x in data:
-    for y in x['tokens']:
-        token.append(y)
-
-
-tokens = [token.append(y) for y in x['tokens'] for x in data ]
-
-print(counter)
-x_train, x_test, y_train, y_test = train_test_split(data, ys,
-                                                    test_size=0.2,
-                                                    random_state=1,
-                                                    stratify=ys)
-
-entities = []
-for d in data:
-    if len(d)!=0:
-        entities = entities+d['entities']
-
-#
-with open(train_file_path, 'w') as f:
-    json.dump(x_train, f)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate SynSpERT-ready JSON from Brat-style .ann/.txt files."
+    )
+    parser.add_argument(
+        "--input_dir",
+        required=True,
+        type=Path,
+        help="Directory containing paired .ann/.txt files (e.g. MDIEC).",
+    )
+    parser.add_argument(
+        "--output_json",
+        type=Path,
+        default=Path("NER&RE_model/InputsAndOutputs/data/dataset/MDIEC.json"),
+        help="Destination JSON file. Defaults to MDIEC.json within the dataset directory.",
+    )
+    return parser.parse_args()
 
 
-with open(test_file_path, 'w') as f:
-    json.dump(x_test, f)
+def main() -> None:
+    args = parse_args()
+    input_dir = args.input_dir.expanduser().resolve()
+    output_json = args.output_json.expanduser().resolve()
 
-with open(all_file_path, 'w') as f:
-    json.dump(data, f)
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+
+    ensure_nltk_punkt()
+
+    docs = convert_directory(input_dir)
+
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(docs, ensure_ascii=False, indent=2))
+
+    print(f"Wrote {len(docs)} sentences to {output_json}")
 
 
-
+if __name__ == "__main__":
+    main()

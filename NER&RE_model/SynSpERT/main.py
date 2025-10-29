@@ -1,19 +1,28 @@
 import argparse
+import re
 from pathlib import Path
 
 import Runner
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:  # pragma: no cover - optional dependency
+    snapshot_download = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BASE_DIR = (Path(__file__).resolve().parent / "../InputsAndOutputs").resolve()
 DATA_DIR = BASE_DIR / "data" / "datasets"
 
-BERT_MODEL = "bert-base-uncased"
+BERT_MODEL_DEFAULT = "bert-base-uncased"
+BERT_MODEL = BERT_MODEL_DEFAULT
+CONFIG_PATH = BERT_MODEL_DEFAULT
+CONFIG_OVERRIDE_SET = False
 MODEL_TYPE = "syn_spert"
 
 LOG_PATH = (BASE_DIR / "data" / "log").resolve()
 SAVE_PATH = (BASE_DIR / "data" / "save").resolve()
 CACHE_PATH = (BASE_DIR / "data" / "cache").resolve()
+MODEL_DOWNLOAD_DIR = (BASE_DIR / "models").resolve()
 
 TRAIN_PATH = (DATA_DIR / "diabetes_train.json").resolve()
 VALID_PATH = (DATA_DIR / "diabetes_valid.json").resolve()
@@ -26,9 +35,64 @@ SEED = 11
 DEFAULT_EVAL_LABEL = f"{RUN_LABEL}_eval"
 
 
-def ensure_directories():
-    for path in [LOG_PATH, SAVE_PATH, CACHE_PATH]:
+def ensure_directories(extra_dir: Path | None = None):
+    paths = [LOG_PATH, SAVE_PATH, CACHE_PATH]
+    if extra_dir:
+        paths.append(extra_dir)
+    for path in paths:
         path.mkdir(parents=True, exist_ok=True)
+
+
+def _sanitize_repo_id(repo_id: str) -> str:
+    return re.sub(r"[^\w.-]", "_", repo_id)
+
+
+def ensure_pretrained_model(model_id: str, download_dir: Path | None) -> str:
+    candidate_path = Path(model_id).expanduser()
+    if candidate_path.exists():
+        return str(candidate_path.resolve())
+
+    if download_dir is None:
+        return model_id
+
+    if snapshot_download is None:
+        raise RuntimeError(
+            "huggingface_hub is required to auto-download pretrained checkpoints. "
+            "Install it or provide a local path via --bert_model."
+        )
+
+    safe_name = _sanitize_repo_id(model_id)
+    target_dir = (download_dir / safe_name).resolve()
+    required_files = ["config.json", "pytorch_model.bin"]
+
+    if target_dir.exists() and all((target_dir / fname).exists() for fname in required_files):
+        return str(target_dir)
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"Failed to download pretrained model '{model_id}': {exc}") from exc
+
+    missing = [fname for fname in required_files if not (target_dir / fname).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Checkpoint '{model_id}' downloaded to '{target_dir}' but missing files: {missing}"
+        )
+
+    tokenizer_exists = any(
+        (target_dir / fname).exists() for fname in ("tokenizer.json", "vocab.txt")
+    )
+    if not tokenizer_exists:
+        raise RuntimeError(
+            f"Checkpoint '{model_id}' at '{target_dir}' does not contain tokenizer files."
+        )
+
+    return str(target_dir)
 
 
 def build_train_args() -> list:
@@ -41,7 +105,7 @@ def build_train_args() -> list:
         "--model_path",
         BERT_MODEL,
         "--tokenizer_path",
-        BERT_MODEL,
+        str(BERT_MODEL),
         "--train_path",
         str(TRAIN_PATH),
         "--valid_path",
@@ -97,7 +161,7 @@ def build_train_args() -> list:
         "--max_seq_length",
         "512",
         "--config_path",
-        BERT_MODEL,
+        str(CONFIG_PATH),
         "--seed",
         str(SEED),
     ]
@@ -107,6 +171,8 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
     dataset_path = cli_args.dataset_path
     label = cli_args.label or DEFAULT_EVAL_LABEL
     model_dir = cli_args.model_dir
+
+    config_arg = CONFIG_PATH if CONFIG_OVERRIDE_SET else str(model_dir)
 
     args = [
         "eval",
@@ -161,7 +227,7 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
         "--max_seq_length",
         "512",
         "--config_path",
-        BERT_MODEL,
+        config_arg,
         "--seed",
         str(SEED),
     ]
@@ -214,12 +280,50 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable storing predictions during evaluation.",
     )
+    parser.add_argument(
+        "--bert_model",
+        type=str,
+        default=BERT_MODEL_DEFAULT,
+        help="Pretrained model name or path for encoder weights and tokenizer.",
+    )
+    parser.add_argument(
+        "--config_override",
+        type=Path,
+        default=None,
+        help="Optional path to a SynSpERT config JSON. Defaults to the model path.",
+    )
+    parser.add_argument(
+        "--download_dir",
+        type=str,
+        default=str(MODEL_DOWNLOAD_DIR),
+        help="Directory used to cache Hugging Face checkpoints locally. "
+        "Set to empty string to disable auto-download.",
+    )
+    parser.add_argument(
+        "--run_seed",
+        type=int,
+        default=None,
+        help="Override training/evaluation seed. Defaults to script constant.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    ensure_directories()
+    download_dir = Path(args.download_dir).expanduser().resolve() if args.download_dir else None
+    ensure_directories(download_dir)
+
+    global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED
+    selected_model = args.bert_model or BERT_MODEL_DEFAULT
+    BERT_MODEL = ensure_pretrained_model(selected_model, download_dir)
+    CONFIG_OVERRIDE_SET = args.config_override is not None
+    CONFIG_PATH = (
+        str(args.config_override.resolve())
+        if CONFIG_OVERRIDE_SET
+        else BERT_MODEL
+    )
+    if args.run_seed is not None:
+        SEED = args.run_seed
 
     if args.mode == "train":
         run_args = build_train_args()
