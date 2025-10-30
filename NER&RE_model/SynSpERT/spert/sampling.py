@@ -7,6 +7,8 @@ from spert import constant
 
 import sys
 
+_UNKNOWN_POS_TAGS = set()
+
 
 def add_syntax_info(doc, context_size: int):
     
@@ -42,9 +44,16 @@ def add_syntax_info(doc, context_size: int):
     wp_pos = [-1]*context_size
     for idx, j in enumerate(doc.tokens):
       #print(idx, "ddd", j,  j.span_start, j.span_end)
-      wp_pos[j.span_start]=constant.POS_TO_ID[doc.pos[idx]]
+      pos_tag = doc.pos[idx]
+      pos_id = constant.POS_TO_ID.get(pos_tag)
+      if pos_id is None:
+        if pos_tag not in _UNKNOWN_POS_TAGS:
+          print(f"### Unknown POS tag encountered: {pos_tag}. Using UNK fallback.")
+          _UNKNOWN_POS_TAGS.add(pos_tag)
+        pos_id = constant.POS_TO_ID[constant.UNK_TOKEN]
+      wp_pos[j.span_start]=pos_id
       for i in range(j.span_start+1,j.span_end):
-        wp_pos[i]=constant.POS_TO_ID[doc.pos[idx]]
+        wp_pos[i]=pos_id
     
     wp_pos[0] = constant.POS_TO_ID['special_token']
     wp_pos[-1] = constant.POS_TO_ID['special_token']
