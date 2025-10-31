@@ -14,7 +14,7 @@ tqdm==4.66.1
 faiss-gpu==1.7.4
 spacy==3.5.3
 scispacy==0.5.3
-en-core-sci-sm @ https://github.com/allenai/scispacy/releases/download/v0.5.3/en_core_sci_sm-0.5.3.tar.gz
+en-core-sci-sm @ https://github.com/allenai/scispacy-models/releases/download/en_core_sci_sm-0.5.3/en_core_sci_sm-0.5.3.tar.gz
 paddlepaddle-gpu==2.5.2.post118
 paddleocr==2.6.1.3
 opencv-python==4.8.1.78
