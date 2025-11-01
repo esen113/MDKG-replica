@@ -126,7 +126,7 @@ def build_train_args() -> list:
         "--eval_batch_size",
         "2",
         "--epochs",
-        "20",
+        "30",
         "--lr",
         "5e-5",
         "--lr_warmup",
