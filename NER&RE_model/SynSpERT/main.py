@@ -34,6 +34,19 @@ SEED = 11
 
 DEFAULT_EVAL_LABEL = f"{RUN_LABEL}_eval"
 
+TRAIN_BATCH_SIZE = 2
+EVAL_BATCH_SIZE = 2
+LEARNING_RATE = 5e-5
+LR_WARMUP = 0.1
+WEIGHT_DECAY = 0.01
+TRAIN_EPOCHS = 40
+NOISE_LAMBDA = 0.15
+NEG_ENTITY_COUNT = 100
+NEG_RELATION_COUNT = 100
+TRAIN_LOG_ITER = 1
+SAVE_OPTIMIZER_ENABLED = False
+FINAL_EVAL_ENABLED = False
+
 
 def ensure_directories(extra_dir: Path | None = None):
     paths = [LOG_PATH, SAVE_PATH, CACHE_PATH]
@@ -96,7 +109,7 @@ def ensure_pretrained_model(model_id: str, download_dir: Path | None) -> str:
 
 
 def build_train_args() -> list:
-    return [
+    args_list = [
         "train",
         "--model_type",
         MODEL_TYPE,
@@ -117,30 +130,30 @@ def build_train_args() -> list:
         "--size_embedding",
         "25",
         "--train_batch_size",
-        "2",
+        str(TRAIN_BATCH_SIZE),
         "--use_pos",
         "--pos_embedding",
         "25",
         "--use_entity_clf",
         "logits",
         "--eval_batch_size",
-        "2",
+        str(EVAL_BATCH_SIZE),
         "--epochs",
-        "30",
+        str(TRAIN_EPOCHS),
         "--lr",
-        "5e-5",
+        str(LEARNING_RATE),
         "--lr_warmup",
-        "0.1",
+        str(LR_WARMUP),
         "--weight_decay",
-        "0.01",
+        str(WEIGHT_DECAY),
         "--max_grad_norm",
         "1.0",
         "--prop_drop",
         "0.1",
         "--neg_entity_count",
-        "100",
+        str(NEG_ENTITY_COUNT),
         "--neg_relation_count",
-        "100",
+        str(NEG_RELATION_COUNT),
         "--max_span_size",
         "10",
         "--rel_filter_threshold",
@@ -164,6 +177,15 @@ def build_train_args() -> list:
         "--seed",
         str(SEED),
     ]
+    if NOISE_LAMBDA is not None:
+        args_list.extend(["--noise_lambda", str(NOISE_LAMBDA)])
+    if TRAIN_LOG_ITER is not None:
+        args_list.extend(["--train_log_iter", str(TRAIN_LOG_ITER)])
+    if SAVE_OPTIMIZER_ENABLED:
+        args_list.append("--save_optimizer")
+    if FINAL_EVAL_ENABLED:
+        args_list.append("--final_eval")
+    return args_list
 
 
 def build_eval_args(cli_args: argparse.Namespace) -> list:
@@ -304,15 +326,45 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override training/evaluation seed. Defaults to script constant.",
     )
+    parser.add_argument(
+        "--log_path",
+        type=Path,
+        default=LOG_PATH,
+        help="Directory for log outputs when running in train mode.",
+    )
+    parser.add_argument(
+        "--save_path",
+        type=Path,
+        default=SAVE_PATH,
+        help="Directory for saving checkpoints when running in train mode.",
+    )
+    parser.add_argument("--train_batch_size", type=int, default=TRAIN_BATCH_SIZE)
+    parser.add_argument("--eval_batch_size", type=int, default=EVAL_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--lr_warmup", type=float, default=LR_WARMUP)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS)
+    parser.add_argument("--noise_lambda", type=float, default=NOISE_LAMBDA)
+    parser.add_argument("--neg_entity_count", type=int, default=NEG_ENTITY_COUNT)
+    parser.add_argument("--neg_relation_count", type=int, default=NEG_RELATION_COUNT)
+    parser.add_argument("--train_log_iter", type=int, default=TRAIN_LOG_ITER)
+    parser.add_argument("--save_optimizer", action="store_true", default=SAVE_OPTIMIZER_ENABLED)
+    parser.add_argument("--final_eval", action="store_true", default=FINAL_EVAL_ENABLED)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED, LOG_PATH, SAVE_PATH
+    global TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, LEARNING_RATE, LR_WARMUP, WEIGHT_DECAY
+    global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
+    global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
+
+    LOG_PATH = Path(args.log_path).expanduser().resolve()
+    SAVE_PATH = Path(args.save_path).expanduser().resolve()
     download_dir = Path(args.download_dir).expanduser().resolve() if args.download_dir else None
     ensure_directories(download_dir)
 
-    global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED
     selected_model = args.bert_model or BERT_MODEL_DEFAULT
     BERT_MODEL = ensure_pretrained_model(selected_model, download_dir)
     CONFIG_OVERRIDE_SET = args.config_override is not None
@@ -323,6 +375,18 @@ def main():
     )
     if args.run_seed is not None:
         SEED = args.run_seed
+    TRAIN_BATCH_SIZE = args.train_batch_size
+    EVAL_BATCH_SIZE = args.eval_batch_size
+    LEARNING_RATE = args.lr
+    LR_WARMUP = args.lr_warmup
+    WEIGHT_DECAY = args.weight_decay
+    TRAIN_EPOCHS = args.epochs
+    NOISE_LAMBDA = args.noise_lambda
+    NEG_ENTITY_COUNT = args.neg_entity_count
+    NEG_RELATION_COUNT = args.neg_relation_count
+    TRAIN_LOG_ITER = args.train_log_iter
+    SAVE_OPTIMIZER_ENABLED = args.save_optimizer
+    FINAL_EVAL_ENABLED = args.final_eval
 
     if args.mode == "train":
         run_args = build_train_args()
