@@ -22,6 +22,30 @@ import torch.nn.functional as F
 ###################
 
 
+class BiaffineRelScorer(nn.Module):
+    def __init__(self, num_relations: int, share_u: bool = False):
+        super().__init__()
+        self.num_relations = num_relations
+        self.share_u = share_u
+        self.U = None  # lazy init: [R,H,H] or [H,H]
+
+    def _lazy_init(self, hdim: int, device):
+        if self.U is None:
+            if self.share_u:
+                U = nn.Parameter(torch.empty(hdim, hdim, device=device))
+                nn.init.xavier_uniform_(U)
+            else:
+                U = nn.Parameter(torch.empty(self.num_relations, hdim, hdim, device=device))
+                nn.init.xavier_uniform_(U)
+            self.register_parameter('U', U)
+
+    def forward(self, h1: torch.Tensor, h2: torch.Tensor) -> torch.Tensor:
+        # h1, h2: [B,P,H]
+        self._lazy_init(h1.size(-1), h1.device)
+        if self.share_u:
+            return torch.einsum('bph,hk,bpk->bp', h1, self.U, h2).unsqueeze(-1)  # [B,P,1]
+        else:
+            return torch.einsum('bph,rhk,bpk->bpr', h1, self.U, h2)               # [B,P,R]
 
 
 #h: vector from BERT of the input sentence. 
@@ -94,6 +118,17 @@ class SpERT(BertPreTrainedModel):
             relc_in_dim +=  entity_types * 2
         if (self._use_pos):
             relc_in_dim +=  self._pos_embedding * 3
+
+        self.use_biaffine     = getattr(config, "use_biaffine", False)
+        self.biaffine_share_u = getattr(config, "biaffine_share_u", False)
+
+        self.use_dist_emb  = getattr(config, "use_dist_emb", False)
+        self._dist_emb_dim = int(getattr(config, "dist_emb_dim", 16))
+        if self.use_dist_emb:
+            relc_in_dim += self._dist_emb_dim
+            cutoffs = getattr(config, "dist_cutoffs", [0,1,2,3,4,5,8,13,21,34,55])
+            self.register_buffer("dist_cutoffs", torch.tensor(cutoffs, dtype=torch.long))
+            self.dist_emb = nn.Embedding(len(cutoffs) + 1, self._dist_emb_dim)
         #print("########### REL CLASSIFIER INPUT DIM = ", relc_in_dim)
             #relc_in_dim = (config.hidden_size ) * 3 + size_embedding * 2
             #relc_in_dim = (config.hidden_size) * 3 + size_embedding * 2
@@ -104,6 +139,10 @@ class SpERT(BertPreTrainedModel):
         #print("####  relc_in_dim = ", relc_in_dim)
 
         self.rel_classifier = nn.Linear(relc_in_dim, relation_types)
+        if self.use_biaffine:
+            self.biaffine = BiaffineRelScorer(relation_types, share_u=self.biaffine_share_u)
+        else:
+            self.biaffine = None
 
            
         self.size_embeddings = nn.Embedding(100, size_embedding)
@@ -219,9 +258,24 @@ class SpERT(BertPreTrainedModel):
             entity_clf_pairs =  entity_clf_pairs.view(batch_size, entity_clf_pairs.shape[1], -1)
             rel_repr = torch.cat([ rel_repr, entity_clf_pairs], dim=2)
         
-        
+        if getattr(self, "use_dist_emb", False):
+            dist = rel_masks.long().sum(-1)
+            bins = torch.bucketize(dist, self.dist_cutoffs)
+            dist_vec = self.dist_emb(bins)
+            rel_repr = torch.cat([rel_repr, dist_vec], dim=2)
+
         rel_repr = self.dropout(rel_repr)
-        chunk_rel_logits = self._run_rel_classifier(rel_repr)
+        if getattr(self, "use_biaffine", False) and self.biaffine is not None:
+            span_dim2 = entity_pairs.size(-1) // 2
+            h1 = entity_pairs[..., :span_dim2]
+            h2 = entity_pairs[..., span_dim2:]
+            bi = self.biaffine(h1, h2)
+            lin = self._run_rel_classifier(rel_repr)
+            if bi.dim() == 3 and bi.size(-1) == 1:
+                bi = bi.expand_as(lin)
+            chunk_rel_logits = bi + lin
+        else:
+            chunk_rel_logits = self._run_rel_classifier(rel_repr)
         return chunk_rel_logits
 
 
