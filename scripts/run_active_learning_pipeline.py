@@ -307,9 +307,18 @@ def run_training(
 
 def final_model_path(save_dir: Path) -> Path:
     final_model = save_dir / "final_model"
-    if not final_model.exists():
-        raise PipelineError(f"Final model directory not found: {final_model}")
-    return final_model
+    if final_model.exists():
+        return final_model
+
+    best_model = save_dir / "best_model"
+    if best_model.exists():
+        print(f"[WARN] final_model not found in {save_dir}. Falling back to best_model.")
+        return best_model
+
+    raise PipelineError(
+        f"Neither final_model nor best_model directories found under {save_dir}. "
+        "Check the training logs for errors or adjust training configuration."
+    )
 
 
 def run_evaluation(
