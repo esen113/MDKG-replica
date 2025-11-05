@@ -377,8 +377,6 @@ def parse_eval_metrics(log_dir: Path) -> dict:
         "relations_nec_micro": None,
     }
     section: str | None = None
-    micro_pattern = re.compile(r"\s*micro\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9]+)")
-
     with log_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -388,7 +386,6 @@ def parse_eval_metrics(log_dir: Path) -> dict:
                 section = "ner"
                 continue
             if line.startswith("--- Relations"):
-                # keep section as None until specific relation block headers appear
                 section = None
                 continue
             if line.startswith("Without named entity classification"):
@@ -398,21 +395,21 @@ def parse_eval_metrics(log_dir: Path) -> dict:
                 section = "relations_nec"
                 continue
 
-            match = micro_pattern.match(raw_line)
-            if match and section:
-                precision, recall, f1, support = match.groups()
-                metric = {
-                    "precision": float(precision),
-                    "recall": float(recall),
-                    "f1": float(f1),
-                    "support": int(support),
-                }
-                if section == "ner":
-                    metrics["ner_micro"] = metric
-                elif section == "relations":
-                    metrics["relations_micro"] = metric
-                elif section == "relations_nec":
-                    metrics["relations_nec_micro"] = metric
+            if section and line.startswith("micro"):
+                parts = line.split()
+                if len(parts) >= 5:
+                    metric = {
+                        "precision": float(parts[1]),
+                        "recall": float(parts[2]),
+                        "f1": float(parts[3]),
+                        "support": int(parts[4]),
+                    }
+                    if section == "ner":
+                        metrics["ner_micro"] = metric
+                    elif section == "relations":
+                        metrics["relations_micro"] = metric
+                    elif section == "relations_nec":
+                        metrics["relations_nec_micro"] = metric
                 section = None
 
     missing = [key for key, value in metrics.items() if value is None]
@@ -542,8 +539,6 @@ def main() -> None:
         label="active_learning_eval_round0",
         eval_batch=args.eval_batch_size,
     )
-    baseline_metrics = parse_eval_metrics(test_eval_dir)
-
     # Evaluate on pool to obtain AL tensors.
     al_dump_dir = ACTIVE_DIR / "round1" / "uncertainty"
     pool_eval_dir = run_evaluation(
@@ -626,7 +621,6 @@ def main() -> None:
         label="active_learning_eval_sft_round1",
         eval_batch=args.eval_batch_size,
     )
-    sft_metrics = parse_eval_metrics(sft_ft_eval_dir)
     preference_jsonl = round1_dir / "dpo_preferences_round1.jsonl"
     build_dpo_preferences(selection["selected_docs"], selection["selected_predictions"], preference_jsonl)
 
@@ -656,19 +650,9 @@ def main() -> None:
         label="active_learning_eval_dpo_round1",
         eval_batch=args.eval_batch_size,
     )
-    dpo_metrics = parse_eval_metrics(dpo_eval_dir)
-
     if not args.keep_temp:
         selected_doc_path.unlink(missing_ok=True)
         selected_pred_path.unlink(missing_ok=True)
-
-    metrics_summary = {
-        "baseline": baseline_metrics,
-        "sft_round1": sft_metrics,
-        "dpo_round1": dpo_metrics,
-    }
-    metrics_path = ACTIVE_DIR / f"active_learning_metrics_{timestamp}.json"
-    metrics_path.write_text(json.dumps(metrics_summary, ensure_ascii=False, indent=2))
 
     summary = {
         "baseline_save_dir": str(base_save_dir),
@@ -686,7 +670,6 @@ def main() -> None:
         "dpo_test_eval": str(dpo_eval_dir),
         "preference_jsonl": str(preference_jsonl),
         "active_learning_workspace": str(round1_dir),
-        "metrics_json": str(metrics_path),
     }
 
     summary_path = ACTIVE_DIR / f"active_learning_summary_{timestamp}.json"
