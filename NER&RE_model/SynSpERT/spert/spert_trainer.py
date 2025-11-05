@@ -5,6 +5,7 @@ import numpy as np
 import csv
 from pathlib import Path
 from scipy.special import entr
+from typing import Optional
 
 import torch
 from torch.nn import DataParallel
@@ -53,7 +54,7 @@ class SpERTTrainer(BaseTrainer):
         # path to export relation extraction examples to
         self._examples_path = os.path.join(self._log_path, 'examples_%s_%s_epoch_%s.html')
 
-    def _load_pretrained_model(self, input_reader: BaseInputReader):
+    def _load_pretrained_model(self, input_reader: BaseInputReader, model_path: Optional[str] = None):
         # create model
         model_class = models.get_model(self.args.model_type) 
         #(Above) self.args.model_type = "syn_spert", model_class = 'SpERT'
@@ -61,11 +62,12 @@ class SpERTTrainer(BaseTrainer):
         # load model
         #config = BertConfig.from_pretrained(self.args.model_path, cache_dir=self.args.cache_path)
         config = self.config   #DKS
-        util.check_version(config, model_class, self.args.model_path)
+        checkpoint_path = model_path or self.args.model_path
+        util.check_version(config, model_class, checkpoint_path)
 
         config.spert_version = model_class.VERSION
         print("**** Calling model_class.from_pretrained(): TYPE: ", self.args.model_type, "****")
-        model = model_class.from_pretrained(self.args.model_path,
+        model = model_class.from_pretrained(checkpoint_path,
                                             config=config,
                                             # SpERT model parameters
                                             cls_token=self._tokenizer.convert_tokens_to_ids('[CLS]'),
@@ -120,6 +122,16 @@ class SpERTTrainer(BaseTrainer):
 
         # create model
         model = self._load_pretrained_model(input_reader)
+
+        self._ft_mode = getattr(self.args, "ft_mode", "sft")
+        self._ref_model = None
+        if self._ft_mode == "dpo":
+            ref_path = getattr(self.args, "dpo_reference", None) or self.args.model_path
+            self._ref_model = self._load_pretrained_model(input_reader, model_path=ref_path)
+            self._ref_model.to(self._device)
+            self._ref_model.eval()
+            for param in self._ref_model.parameters():
+                param.requires_grad_(False)
         # SpERT is currently optimized on a single GPU and not thoroughly tested in a multi GPU setup
         # If you still want to train SpERT on multiple GPUs, uncomment the following lines
         # # parallelize model
@@ -172,7 +184,18 @@ class SpERTTrainer(BaseTrainer):
         # create loss function
         rel_criterion = torch.nn.BCEWithLogitsLoss(reduction='none')
         entity_criterion = torch.nn.CrossEntropyLoss(reduction='none')
-        compute_loss = SpERTLoss(rel_criterion, entity_criterion, model, optimizer, scheduler, args.max_grad_norm)
+        compute_loss = SpERTLoss(
+            rel_criterion,
+            entity_criterion,
+            model,
+            optimizer,
+            scheduler,
+            args.max_grad_norm,
+            ft_mode=getattr(self.args, "ft_mode", "sft"),
+            dpo_beta=getattr(self.args, "dpo_beta", 0.1),
+            dpo_lambda=getattr(self.args, "dpo_lambda", 0.1),
+            dpo_negatives=getattr(self.args, "dpo_negatives", 4),
+        )
 
         best_model = None #DKS
         best_rel_f1_micro=0
@@ -273,11 +296,29 @@ class SpERTTrainer(BaseTrainer):
                                               relations=batch['rels'], rel_masks=batch['rel_masks'],
                                               dephead= batch['dephead'], deplabel =batch['deplabel'], pos= batch['pos'])
 
+            ref_entity_logits = None
+            ref_rel_logits = None
+            if getattr(self, "_ft_mode", "sft") == "dpo" and self._ref_model is not None:
+                with torch.no_grad():
+                    ref_entity_logits, ref_rel_logits = self._ref_model(
+                        encodings=batch['encodings'],
+                        context_masks=batch['context_masks'],
+                        entity_masks=batch['entity_masks'],
+                        entity_sizes=batch['entity_sizes'],
+                        relations=batch['rels'],
+                        rel_masks=batch['rel_masks'],
+                        dephead=batch['dephead'],
+                        deplabel=batch['deplabel'],
+                        pos=batch['pos'],
+                    )
+
             # compute loss and optimize parameters
             batch_loss = compute_loss.compute(entity_logits=entity_logits, rel_logits=rel_logits,
                                               rel_types=batch['rel_types'], entity_types=batch['entity_types'],
                                               entity_sample_masks=batch['entity_sample_masks'],
-                                              rel_sample_masks=batch['rel_sample_masks'])
+                                              rel_sample_masks=batch['rel_sample_masks'],
+                                              ref_entity_logits=ref_entity_logits,
+                                              ref_rel_logits=ref_rel_logits)
 
             # logging
             iteration += 1

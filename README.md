@@ -78,6 +78,41 @@ Outputs:
 
 ---
 
+### 2.4 Export data for other model families
+
+Once the SynSpERT JSON splits are ready, you can auto-generate inputs for other popular NER+RE frameworks:
+
+```bash
+# DyGIE++ (document-level JSONL)
+python scripts/convert_to_dygie.py \
+  --input-json 'NER&RE_model/InputsAndOutputs/data/datasets/diabetes_all.json' \
+  --output-jsonl 'NER&RE_model/InputsAndOutputs/data/exports/dygie/diabetes.jsonl' \
+  --dataset-name mdkg_diabetes
+
+# PURE (NER BIO + RE jsonl files)
+python scripts/convert_to_pure.py \
+  --input-dir 'NER&RE_model/InputsAndOutputs/data/datasets' \
+  --prefix diabetes \
+  --output-dir 'NER&RE_model/InputsAndOutputs/data/exports/pure'
+
+# PL-Marker (entity-marker sequences; add --include-negative for negatives)
+python scripts/convert_to_pl_marker.py \
+  --input-json 'NER&RE_model/InputsAndOutputs/data/datasets/diabetes_train.json' \
+  --output-jsonl 'NER&RE_model/InputsAndOutputs/data/exports/pl_marker/diabetes_train.jsonl' \
+  --include-negative
+
+# DPO preference triplets (human vs model annotations)
+python scripts/prepare_dpo_preferences.py \
+  --human-json 'NER&RE_model/InputsAndOutputs/data/datasets/diabetes_train.json' \
+  --prediction-json 'NER&RE_model/InputsAndOutputs/data/log/diabetes_small_run/<timestamp>/predictions_train_epoch_0.json' \
+  --output-jsonl 'NER&RE_model/InputsAndOutputs/data/exports/dpo/diabetes_train.jsonl'
+```
+
+- SpERT / SynSpERT variants, biaffine relation heads, and multi-head selection models can consume the existing SynSpERT JSON directly—no extra conversion required.
+- The converters write into `NER&RE_model/InputsAndOutputs/data/exports/<model>/` by default in the examples above; adjust paths as needed (create the `exports` folder first if it does not exist).
+
+---
+
 ## 3. Training
 
 The training entrypoint supports both local checkpoints and Hugging Face model IDs. Key CLI flags:
@@ -86,6 +121,8 @@ The training entrypoint supports both local checkpoints and Hugging Face model I
 - `--config_override`: optional SynSpERT config JSON (otherwise the model directory/config is reused)
 - `--download_dir`: cache location for downloaded Hugging Face models (defaults to `NER&RE_model/InputsAndOutputs/models`)
 - `--run_seed`: overrides the run seed used in logs/checkpoint names
+- `--ft_mode`: choose between `sft` (默认监督微调) 或 `dpo`（偏好优化，需提供参考模型/偏好数据）
+- `--dpo_reference`, `--dpo_beta`, `--dpo_lambda`, `--dpo_negatives`: DPO 模式下的参考权重路径与超参
 
 ### Example: CODER++
 
@@ -178,6 +215,7 @@ Evaluation artifacts:
    - `selected_indices_round01.pt` (+ optional analytics)
 
 4. **Annotate & refresh** – merge annotated items back into the training JSON, rerun §2.3 and §3, repeat until convergence/budget exhaustion.
+- 微调阶段默认使用 `--ft_mode sft`；若要改为 DPO，先用 `scripts/prepare_dpo_preferences.py` 生成偏好数据，再在训练命令中加 `--ft_mode dpo --dpo_reference <参考模型>` 及相关超参。
 
 ---
 
@@ -188,6 +226,7 @@ Evaluation artifacts:
 | `scripts/fetch_official_data.py` | Pull MDIEC zip from Hugging Face and extract locally |
 | `NER&RE_model/SynSpERT/generate_input.py` | Convert `.ann/.txt` directories to SynSpERT JSON |
 | `NER&RE_model/SynSpERT/generate_augmented_input.py` | Add linguistic features & produce train/valid/test splits |
+| `scripts/prepare_dpo_preferences.py` | Combine人工标注与模型预测，产出 DPO 偏好数据 |
 | `NER&RE_model/SynSpERT/main.py` | Unified CLI for training (`--mode train`) and evaluation (`--mode eval`) with backbone selection |
 | `NER&RE_model/SynSpERT/spert/spert_trainer.py` | Training loop; emits AL tensors when `--al_dump_dir` is set |
 | `Active_learning.py` | Entropy + diversity sampler used during annotation rounds |

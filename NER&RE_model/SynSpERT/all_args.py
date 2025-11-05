@@ -92,6 +92,16 @@ def get_argparser():
     arg_parser.add_argument('--weight_decay', type=float, default=0.01, help="Weight decay to apply")
     arg_parser.add_argument('--max_grad_norm', type=float, default=1.0, help="Maximum gradient norm")
     arg_parser.add_argument('--noise_lambda', type=float, default=0.15, help="noise_lambda for noisy tune")
+    arg_parser.add_argument('--ft_mode', type=str, choices=("sft", "dpo"), default="sft",
+                            help="Fine-tuning mode after active learning (sft=standard CE, dpo=preference optimisation).")
+    arg_parser.add_argument('--dpo_beta', type=float, default=0.1,
+                            help="Beta temperature for DPO loss (only used when --ft_mode dpo).")
+    arg_parser.add_argument('--dpo_lambda', type=float, default=0.1,
+                            help="Weight assigned to the DPO loss term (only used when --ft_mode dpo).")
+    arg_parser.add_argument('--dpo_negatives', type=int, default=4,
+                            help="Number of negative classes sampled per example for DPO (entities/relations).")
+    arg_parser.add_argument('--dpo_reference', type=str, default=None,
+                            help="Path to reference checkpoint used for DPO comparisons. Defaults to model_path.")
 
 #    _add_common_args(arg_parser)
 
