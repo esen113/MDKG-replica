@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -258,6 +259,7 @@ def run_training(
     dpo_beta: float = 0.1,
     dpo_lambda: float = 0.1,
     dpo_negatives: int = 4,
+    dpo_reference: str | None = None,
 ) -> tuple[Path, Path]:
     print(f"[TRAIN] Starting training run '{label_suffix}'.")
     cmd = [
@@ -299,6 +301,8 @@ def run_training(
                 str(dpo_negatives),
             ]
         )
+        if dpo_reference:
+            cmd.extend(["--dpo_reference", dpo_reference])
     run_command(cmd, cwd=REPO_ROOT)
     log_dir, save_dir = relocate_training_run(label_suffix)
     print(f"[TRAIN] Artifacts moved to {save_dir}")
@@ -341,8 +345,6 @@ def run_evaluation(
         label,
         "--eval_batch_size",
         str(eval_batch),
-        "--model_type",
-        "syn_spert",
         "--log_path",
         str(LOG_DIR),
         "--save_path",
@@ -362,6 +364,62 @@ def load_json(path: Path) -> list:
 def dump_json(path: Path, data: Iterable, indent: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(list(data), ensure_ascii=False, indent=indent))
+
+
+def parse_eval_metrics(log_dir: Path) -> dict:
+    log_path = log_dir / "all.log"
+    if not log_path.exists():
+        raise PipelineError(f"Evaluation log not found: {log_path}")
+
+    metrics: dict[str, dict[str, float]] = {
+        "ner_micro": None,
+        "relations_micro": None,
+        "relations_nec_micro": None,
+    }
+    section: str | None = None
+    micro_pattern = re.compile(r"\s*micro\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9]+)")
+
+    with log_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("--- Entities"):
+                section = "ner"
+                continue
+            if line.startswith("--- Relations"):
+                # keep section as None until specific relation block headers appear
+                section = None
+                continue
+            if line.startswith("Without named entity classification"):
+                section = "relations"
+                continue
+            if line.startswith("With named entity classification"):
+                section = "relations_nec"
+                continue
+
+            match = micro_pattern.match(raw_line)
+            if match and section:
+                precision, recall, f1, support = match.groups()
+                metric = {
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                    "support": int(support),
+                }
+                if section == "ner":
+                    metrics["ner_micro"] = metric
+                elif section == "relations":
+                    metrics["relations_micro"] = metric
+                elif section == "relations_nec":
+                    metrics["relations_nec_micro"] = metric
+                section = None
+
+    missing = [key for key, value in metrics.items() if value is None]
+    if missing:
+        raise PipelineError(f"Failed to parse metrics {missing} from {log_path}")
+
+    return metrics
 
 
 def select_low_confidence_samples(
@@ -484,6 +542,7 @@ def main() -> None:
         label="active_learning_eval_round0",
         eval_batch=args.eval_batch_size,
     )
+    baseline_metrics = parse_eval_metrics(test_eval_dir)
 
     # Evaluate on pool to obtain AL tensors.
     al_dump_dir = ACTIVE_DIR / "round1" / "uncertainty"
@@ -522,6 +581,8 @@ def main() -> None:
 
     dump_json(selected_doc_path, selection["selected_docs"])
     dump_json(selected_pred_path, selection["selected_predictions"])
+    baseline_pred_path = round1_dir / "selected_predictions_round1_baseline.json"
+    dump_json(baseline_pred_path, selection["selected_predictions"])
     dump_json(remaining_pool_path, selection["remaining_docs"])
     dump_json(
         selection_meta_path,
@@ -544,10 +605,6 @@ def main() -> None:
     merged_train_docs = base_train_docs + selection["selected_docs"]
     dump_json(train_path, merged_train_docs)
 
-    # Prepare DPO preference file for bookkeeping.
-    preference_jsonl = round1_dir / "dpo_preferences_round1.jsonl"
-    build_dpo_preferences(selection["selected_docs"], selection["selected_predictions"], preference_jsonl)
-
     # SFT fine-tuning on the expanded training set.
     sft_ft_seed = args.seed + 51
     sft_ft_log_dir, sft_ft_save_dir = run_training(
@@ -569,12 +626,15 @@ def main() -> None:
         label="active_learning_eval_sft_round1",
         eval_batch=args.eval_batch_size,
     )
+    sft_metrics = parse_eval_metrics(sft_ft_eval_dir)
+    preference_jsonl = round1_dir / "dpo_preferences_round1.jsonl"
+    build_dpo_preferences(selection["selected_docs"], selection["selected_predictions"], preference_jsonl)
 
-    # DPO fine-tuning (starting from baseline weights).
+    # DPO fine-tuning (starting from the SFT-finetuned model).
     dpo_seed = args.seed + 101
     dpo_log_dir, dpo_save_dir = run_training(
         label_suffix="active_learning_dpo_round1",
-        bert_model=str(base_model),
+        bert_model=str(sft_ft_model),
         config_path=args.config,
         seed=dpo_seed,
         epochs=args.dpo_epochs,
@@ -585,6 +645,7 @@ def main() -> None:
         dpo_beta=args.dpo_beta,
         dpo_lambda=args.dpo_lambda,
         dpo_negatives=args.dpo_negatives,
+        dpo_reference=str(sft_ft_model),
     )
     dpo_model = final_model_path(dpo_save_dir)
 
@@ -595,10 +656,19 @@ def main() -> None:
         label="active_learning_eval_dpo_round1",
         eval_batch=args.eval_batch_size,
     )
+    dpo_metrics = parse_eval_metrics(dpo_eval_dir)
 
     if not args.keep_temp:
         selected_doc_path.unlink(missing_ok=True)
         selected_pred_path.unlink(missing_ok=True)
+
+    metrics_summary = {
+        "baseline": baseline_metrics,
+        "sft_round1": sft_metrics,
+        "dpo_round1": dpo_metrics,
+    }
+    metrics_path = ACTIVE_DIR / f"active_learning_metrics_{timestamp}.json"
+    metrics_path.write_text(json.dumps(metrics_summary, ensure_ascii=False, indent=2))
 
     summary = {
         "baseline_save_dir": str(base_save_dir),
@@ -607,6 +677,7 @@ def main() -> None:
         "pool_eval_dir": str(pool_eval_dir),
         "selected_count": len(selection["selected_docs"]),
         "selection_metric": args.selection_metric,
+        "baseline_selection_predictions": str(baseline_pred_path),
         "sft_ft_save_dir": str(sft_ft_save_dir),
         "sft_ft_log_dir": str(sft_ft_log_dir),
         "sft_ft_test_eval": str(sft_ft_eval_dir),
@@ -615,6 +686,7 @@ def main() -> None:
         "dpo_test_eval": str(dpo_eval_dir),
         "preference_jsonl": str(preference_jsonl),
         "active_learning_workspace": str(round1_dir),
+        "metrics_json": str(metrics_path),
     }
 
     summary_path = ACTIVE_DIR / f"active_learning_summary_{timestamp}.json"
