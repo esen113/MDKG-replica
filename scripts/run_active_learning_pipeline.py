@@ -3,17 +3,21 @@
 """
 One-click MDKG active-learning + DPO demo.
 
-Pipeline overview (single AL round):
+Pipeline overview (multi-round AL):
   1. (Optional) create GPU-ready Conda env and install dependencies.
   2. Download MDIEC annotations from Hugging Face if missing.
-  3. Convert `.ann/.txt` files into SynSpERT JSON and split 0.6/0.1/0.3.
-  4. Train a baseline SynSpERT model (SFT) on the 60% training split.
-  5. Evaluate the baseline on the held-out test set (10%).
-  6. Treat the 30% split as unlabeled pool: run eval with AL tensors and
-     select low-confidence samples.
-  7. Merge selected samples into the training set, then fine-tune once with
-     standard SFT and once with `--ft_mode dpo` (same starting checkpoint).
-  8. Re-evaluate both SFT-FT and DPO-FT models on the test split.
+  3. Convert `.ann/.txt` files into SynSpERT JSON and split counts
+     (default: 300 train / 150 eval / remainder pool).
+  4. Train a baseline SynSpERT model (SFT) on the base training split and
+     evaluate on the held-out validation/test set.
+  5. For each active-learning round:
+       a. Expose a batch of pool samples, run eval with AL tensors,并挑出
+          `--al-sample-count` 个低置信度样本。
+       b. 把新样本并入训练集，以上一轮 checkpoint warm-start 做 SFT 微调，
+          同时在固定测试集和该批新样本上各评估一次。
+       c. 用“人工标注 vs 最新 SFT 推理”构造偏好对（仅保留仍有差异的样本），
+          可选跑一段 DPO，然后在测试集评估。
+       d. 记录当轮所有 artifact，并把未被选中的样本放回池子，继续下一轮。
 
 Artifacts are stored under `NER&RE_model/InputsAndOutputs/data/active_learning/`.
 
@@ -23,20 +27,23 @@ Example (`python scripts/run_active_learning_pipeline.py`):
         --setup-env \
         --bert-model GanjinZero/coder_eng_pp \
         --config NER&RE_model/SynSpERT/configs/config-coder.json \
-        --al-sample-count 50
+        --al-sample-count 50 \
+        --pool-release-size 100 \
+        --max-rounds 3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, Sequence
 
 import torch
 
@@ -75,8 +82,18 @@ def parse_args() -> argparse.Namespace:
 
     data = parser.add_argument_group("Data preparation")
     data.add_argument("--skip-download", action="store_true", help="Skip fetching MDIEC data from Hugging Face.")
-    data.add_argument("--train-ratio", type=float, default=0.6, help="Train split ratio for generate_augmented_input.py.")
-    data.add_argument("--valid-ratio", type=float, default=0.1, help="Validation (test) split ratio.")
+    data.add_argument(
+        "--train-count",
+        type=int,
+        default=300,
+        help="Number of documents used for the initial supervised training split.",
+    )
+    data.add_argument(
+        "--valid-count",
+        type=int,
+        default=150,
+        help="Number of documents reserved as the fixed validation/test set.",
+    )
     data.add_argument("--prefix", default=DEFAULT_PREFIX, help="Dataset prefix (defaults to SynSpERT's diabetes).")
 
     train = parser.add_argument_group("Training")
@@ -109,7 +126,19 @@ def parse_args() -> argparse.Namespace:
         "--al-sample-count",
         type=int,
         default=50,
-        help="Number of low-confidence pool documents promoted for annotation / DPO.",
+        help="Number of low-confidence pool documents promoted for annotation / DPO per round.",
+    )
+    al.add_argument(
+        "--pool-release-size",
+        type=int,
+        default=100,
+        help="Pool batch size exposed for selection each round.",
+    )
+    al.add_argument(
+        "--max-rounds",
+        type=int,
+        default=1,
+        help="Maximum number of active-learning rounds to execute.",
     )
     al.add_argument(
         "--selection-metric",
@@ -163,7 +192,7 @@ def download_data() -> None:
     run_command(["python", str(REPO_ROOT / "scripts" / "fetch_official_data.py"), "--overwrite"], cwd=REPO_ROOT)
 
 
-def generate_synspert_inputs(train_ratio: float, valid_ratio: float, prefix: str) -> None:
+def generate_synspert_inputs(train_count: int, valid_count: int, prefix: str, seed: int) -> None:
     print("[DATA] Converting Brat annotations to SynSpERT JSON.")
     run_command(
         [
@@ -177,23 +206,29 @@ def generate_synspert_inputs(train_ratio: float, valid_ratio: float, prefix: str
         cwd=REPO_ROOT,
     )
 
-    print("[DATA] Generating augmented splits.")
-    run_command(
-        [
-            "python",
-            str(NER_ROOT / "SynSpERT" / "generate_augmented_input.py"),
-            "--input",
-            str(DATASET_JSON),
-            "--output_dir",
-            str(SPLIT_DIR),
-            "--prefix",
-            prefix,
-            "--train_ratio",
-            str(train_ratio),
-            "--valid_ratio",
-            str(valid_ratio),
-        ],
-        cwd=REPO_ROOT,
+    print("[DATA] Shuffling corpus and creating custom splits.")
+    docs = load_json(DATASET_JSON)
+    total = len(docs)
+    if train_count + valid_count >= total:
+        raise PipelineError(
+            f"Requested train ({train_count}) + valid ({valid_count}) consumes entire dataset of {total} documents."
+        )
+
+    rng = random.Random(seed)
+    rng.shuffle(docs)
+
+    train_docs = docs[:train_count]
+    valid_docs = docs[train_count : train_count + valid_count]
+    pool_docs = docs[train_count + valid_count :]
+
+    SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+    dump_json(SPLIT_DIR / f"{prefix}_train.json", train_docs)
+    dump_json(SPLIT_DIR / f"{prefix}_valid.json", valid_docs)
+    dump_json(SPLIT_DIR / f"{prefix}_test.json", pool_docs)
+
+    print(
+        f"[DATA] Split complete: train={len(train_docs)}, valid/test={len(valid_docs)}, pool={len(pool_docs)} "
+        f"(seed={seed})."
     )
 
 
@@ -462,8 +497,10 @@ def select_low_confidence_samples(
     }
 
 
-def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path) -> None:
+def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    skipped = 0
     with output_jsonl.open("w", encoding="utf-8") as fout:
         for doc, pred in zip(human_docs, model_docs):
             tokens = doc.get("tokens", [])
@@ -486,6 +523,10 @@ def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path
                 ),
             }
 
+            if chosen == rejected:
+                skipped += 1
+                continue
+
             record = {
                 "prompt": prompt,
                 "chosen": json.dumps(chosen, ensure_ascii=False, sort_keys=True),
@@ -494,6 +535,16 @@ def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path
             }
             fout.write(json.dumps(record, ensure_ascii=False))
             fout.write("\n")
+            kept += 1
+
+    if kept == 0:
+        print(
+            "[WARN] All selected samples perfectly matched the latest SFT predictions; "
+            "no DPO preference pairs were generated."
+        )
+    elif skipped:
+        print(f"[INFO] Skipped {skipped} preference pairs where model output already matched the ground truth.")
+    return kept
 
 
 def main() -> None:
@@ -505,7 +556,7 @@ def main() -> None:
     if not args.skip_download:
         download_data()
 
-    generate_synspert_inputs(args.train_ratio, args.valid_ratio, args.prefix)
+    generate_synspert_inputs(args.train_count, args.valid_count, args.prefix, args.seed)
     train_path, valid_path, pool_path = dataset_paths(args.prefix)
 
     ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -539,145 +590,214 @@ def main() -> None:
         label="active_learning_eval_round0",
         eval_batch=args.eval_batch_size,
     )
-    # Evaluate on pool to obtain AL tensors.
-    al_dump_dir = ACTIVE_DIR / "round1" / "uncertainty"
-    pool_eval_dir = run_evaluation(
-        model_dir=base_model,
-        dataset_path=pool_path,
-        label="active_learning_pool_round0",
-        eval_batch=args.eval_batch_size,
-        al_dump_dir=al_dump_dir,
-    )
 
-    predictions_path = pool_eval_dir / "predictions_test_epoch_0.json"
-    entropy_entities = al_dump_dir / "entropy_entities.pt"
-    entropy_relations = al_dump_dir / "entropy_relation.pt"
-
-    if not predictions_path.exists():
-        raise PipelineError(f"Prediction JSON not found at {predictions_path}")
-    if not entropy_entities.exists() or not entropy_relations.exists():
-        raise PipelineError("Entropy tensors missing; ensure --al_dump_dir evaluation succeeded.")
-
-    selection = select_low_confidence_samples(
-        pool_path=pool_path,
-        predictions_path=predictions_path,
-        entropy_entities=entropy_entities,
-        entropy_relations=entropy_relations,
-        count=args.al_sample_count,
-        metric=args.selection_metric,
-    )
-
-    round1_dir = ACTIVE_DIR / "round1"
-    round1_dir.mkdir(parents=True, exist_ok=True)
-    selected_doc_path = round1_dir / "selected_docs_round1.json"
-    selected_pred_path = round1_dir / "selected_predictions_round1.json"
-    remaining_pool_path = round1_dir / "pool_remaining_round1.json"
-    selection_meta_path = round1_dir / "selection_round1.json"
-
-    dump_json(selected_doc_path, selection["selected_docs"])
-    dump_json(selected_pred_path, selection["selected_predictions"])
-    baseline_pred_path = round1_dir / "selected_predictions_round1_baseline.json"
-    dump_json(baseline_pred_path, selection["selected_predictions"])
-    dump_json(remaining_pool_path, selection["remaining_docs"])
-    dump_json(
-        selection_meta_path,
-        [
-            {
-                "index": idx,
-                "orig_id": selection["selected_docs"][i].get("orig_id"),
-                "entity_entropy": selection["entity_entropy"][i],
-                "relation_entropy": selection["relation_entropy"][i],
-            }
-            for i, idx in enumerate(selection["selected_indices"])
-        ],
-    )
-
-    # Update pool file by removing selected samples.
-    dump_json(pool_path, selection["remaining_docs"])
-
-    # Merge selected docs into training set and overwrite canonical train JSON.
-    base_train_docs = load_json(train_path)
-    merged_train_docs = base_train_docs + selection["selected_docs"]
-    dump_json(train_path, merged_train_docs)
-
-    # SFT fine-tuning on the expanded training set.
-    sft_ft_seed = args.seed + 51
-    sft_ft_log_dir, sft_ft_save_dir = run_training(
-        label_suffix="active_learning_sft_round1",
-        bert_model=str(base_model),
-        config_path=args.config,
-        seed=sft_ft_seed,
-        epochs=args.sft_ft_epochs,
-        lr=args.sft_ft_learning_rate,
-        train_batch=args.train_batch_size,
-        eval_batch=args.eval_batch_size,
-        ft_mode="sft",
-    )
-    sft_ft_model = final_model_path(sft_ft_save_dir)
-
-    sft_ft_eval_dir = run_evaluation(
-        model_dir=sft_ft_model,
-        dataset_path=valid_path,
-        label="active_learning_eval_sft_round1",
-        eval_batch=args.eval_batch_size,
-    )
-    preference_jsonl = round1_dir / "dpo_preferences_round1.jsonl"
-    build_dpo_preferences(selection["selected_docs"], selection["selected_predictions"], preference_jsonl)
-
-    # DPO fine-tuning (starting from the SFT-finetuned model).
-    dpo_seed = args.seed + 101
-    dpo_log_dir, dpo_save_dir = run_training(
-        label_suffix="active_learning_dpo_round1",
-        bert_model=str(sft_ft_model),
-        config_path=args.config,
-        seed=dpo_seed,
-        epochs=args.dpo_epochs,
-        lr=args.dpo_learning_rate,
-        train_batch=args.train_batch_size,
-        eval_batch=args.eval_batch_size,
-        ft_mode="dpo",
-        dpo_beta=args.dpo_beta,
-        dpo_lambda=args.dpo_lambda,
-        dpo_negatives=args.dpo_negatives,
-        dpo_reference=str(sft_ft_model),
-    )
-    dpo_model = final_model_path(dpo_save_dir)
-
-    # Evaluate DPO model on the held-out test split.
-    dpo_eval_dir = run_evaluation(
-        model_dir=dpo_model,
-        dataset_path=valid_path,
-        label="active_learning_eval_dpo_round1",
-        eval_batch=args.eval_batch_size,
-    )
-    if not args.keep_temp:
-        selected_doc_path.unlink(missing_ok=True)
-        selected_pred_path.unlink(missing_ok=True)
-
-    summary = {
+    baseline_summary = {
         "baseline_save_dir": str(base_save_dir),
         "baseline_log_dir": str(base_log_dir),
         "baseline_test_eval": str(test_eval_dir),
-        "pool_eval_dir": str(pool_eval_dir),
-        "selected_count": len(selection["selected_docs"]),
-        "selection_metric": args.selection_metric,
-        "baseline_selection_predictions": str(baseline_pred_path),
-        "sft_ft_save_dir": str(sft_ft_save_dir),
-        "sft_ft_log_dir": str(sft_ft_log_dir),
-        "sft_ft_test_eval": str(sft_ft_eval_dir),
-        "dpo_save_dir": str(dpo_save_dir),
-        "dpo_log_dir": str(dpo_log_dir),
-        "dpo_test_eval": str(dpo_eval_dir),
-        "preference_jsonl": str(preference_jsonl),
-        "active_learning_workspace": str(round1_dir),
+    }
+
+    train_docs_cache = load_json(train_path)
+    pool_docs_cache = load_json(pool_path)
+    round_summaries: list[dict] = []
+    current_model = base_model
+
+    for round_idx in range(1, args.max_rounds + 1):
+        if not pool_docs_cache:
+            print(f"[AL] Pool exhausted before round {round_idx}; stopping.")
+            break
+
+        release_size = min(args.pool_release_size, len(pool_docs_cache))
+        release_docs = pool_docs_cache[:release_size]
+        pool_docs_cache = pool_docs_cache[release_size:]
+
+        round_dir = ACTIVE_DIR / f"round{round_idx}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        round_pool_path = round_dir / f"{args.prefix}_pool_round{round_idx}.json"
+        dump_json(round_pool_path, release_docs)
+        al_dump_dir = round_dir / "uncertainty"
+
+        pool_eval_label = f"active_learning_pool_round{round_idx}"
+        pool_eval_dir = run_evaluation(
+            model_dir=current_model,
+            dataset_path=round_pool_path,
+            label=pool_eval_label,
+            eval_batch=args.eval_batch_size,
+            al_dump_dir=al_dump_dir,
+        )
+
+        predictions_path = pool_eval_dir / "predictions_test_epoch_0.json"
+        entropy_entities = al_dump_dir / "entropy_entities.pt"
+        entropy_relations = al_dump_dir / "entropy_relation.pt"
+
+        if not predictions_path.exists():
+            raise PipelineError(f"Prediction JSON not found at {predictions_path}")
+        if not entropy_entities.exists() or not entropy_relations.exists():
+            raise PipelineError("Entropy tensors missing; ensure --al_dump_dir evaluation succeeded.")
+
+        actual_sample_count = min(args.al_sample_count, len(release_docs))
+        if actual_sample_count == 0:
+            print(f"[AL] Round {round_idx}: no candidates available; stopping.")
+            break
+
+        selection = select_low_confidence_samples(
+            pool_path=round_pool_path,
+            predictions_path=predictions_path,
+            entropy_entities=entropy_entities,
+            entropy_relations=entropy_relations,
+            count=actual_sample_count,
+            metric=args.selection_metric,
+        )
+
+        selected_doc_path = round_dir / f"selected_docs_round{round_idx}.json"
+        sft_pred_path = round_dir / f"selected_predictions_round{round_idx}_sft.json"
+        baseline_pred_path = round_dir / f"selected_predictions_round{round_idx}_baseline.json"
+        remaining_pool_path = round_dir / f"pool_remaining_round{round_idx}.json"
+        selection_meta_path = round_dir / f"selection_round{round_idx}.json"
+
+        dump_json(selected_doc_path, selection["selected_docs"])
+        dump_json(baseline_pred_path, selection["selected_predictions"])
+        dump_json(remaining_pool_path, selection["remaining_docs"])
+        dump_json(
+            selection_meta_path,
+            [
+                {
+                    "index": idx,
+                    "orig_id": selection["selected_docs"][i].get("orig_id"),
+                    "entity_entropy": selection["entity_entropy"][i],
+                    "relation_entropy": selection["relation_entropy"][i],
+                }
+                for i, idx in enumerate(selection["selected_indices"])
+            ],
+        )
+
+        # Reinsert unselected docs to the front of the remaining pool and persist split.
+        pool_docs_cache = selection["remaining_docs"] + pool_docs_cache
+        dump_json(pool_path, pool_docs_cache)
+
+        # Merge selected samples into the supervised training set.
+        train_docs_cache = train_docs_cache + selection["selected_docs"]
+        dump_json(train_path, train_docs_cache)
+
+        # SFT fine-tuning on the expanded training set.
+        sft_ft_seed = args.seed + 51 + round_idx
+        sft_label_suffix = f"active_learning_sft_round{round_idx}"
+        sft_ft_log_dir, sft_ft_save_dir = run_training(
+            label_suffix=sft_label_suffix,
+            bert_model=str(current_model),
+            config_path=args.config,
+            seed=sft_ft_seed,
+            epochs=args.sft_ft_epochs,
+            lr=args.sft_ft_learning_rate,
+            train_batch=args.train_batch_size,
+            eval_batch=args.eval_batch_size,
+            ft_mode="sft",
+        )
+        sft_ft_model = final_model_path(sft_ft_save_dir)
+        current_model = sft_ft_model
+
+        sft_eval_label = f"active_learning_eval_sft_round{round_idx}"
+        sft_ft_eval_dir = run_evaluation(
+            model_dir=sft_ft_model,
+            dataset_path=valid_path,
+            label=sft_eval_label,
+            eval_batch=args.eval_batch_size,
+        )
+        selected_eval_label = f"active_learning_selected_sft_round{round_idx}"
+        selected_eval_dir = run_evaluation(
+            model_dir=sft_ft_model,
+            dataset_path=selected_doc_path,
+            label=selected_eval_label,
+            eval_batch=args.eval_batch_size,
+        )
+        sft_selected_pred_path = selected_eval_dir / "predictions_test_epoch_0.json"
+        if not sft_selected_pred_path.exists():
+            raise PipelineError(f"SFT predictions for selected docs not found: {sft_selected_pred_path}")
+        sft_selected_predictions = load_json(sft_selected_pred_path)
+        dump_json(sft_pred_path, sft_selected_predictions)
+
+        preference_jsonl = round_dir / f"dpo_preferences_round{round_idx}.jsonl"
+        preference_count = build_dpo_preferences(selection["selected_docs"], sft_selected_predictions, preference_jsonl)
+
+        dpo_save_dir = dpo_log_dir = dpo_eval_dir = None
+        dpo_model = None
+        if preference_count > 0 and args.dpo_epochs > 0:
+            dpo_seed = args.seed + 101 + round_idx
+            dpo_label_suffix = f"active_learning_dpo_round{round_idx}"
+            dpo_log_dir, dpo_save_dir = run_training(
+                label_suffix=dpo_label_suffix,
+                bert_model=str(sft_ft_model),
+                config_path=args.config,
+                seed=dpo_seed,
+                epochs=args.dpo_epochs,
+                lr=args.dpo_learning_rate,
+                train_batch=args.train_batch_size,
+                eval_batch=args.eval_batch_size,
+                ft_mode="dpo",
+                dpo_beta=args.dpo_beta,
+                dpo_lambda=args.dpo_lambda,
+                dpo_negatives=args.dpo_negatives,
+                dpo_reference=str(sft_ft_model),
+            )
+            dpo_model = final_model_path(dpo_save_dir)
+            dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
+            dpo_eval_dir = run_evaluation(
+                model_dir=dpo_model,
+                dataset_path=valid_path,
+                label=dpo_eval_label,
+                eval_batch=args.eval_batch_size,
+            )
+        elif preference_count == 0:
+            print(f"[WARN] Round {round_idx}: no DPO pairs; skipping DPO fine-tuning.")
+
+        if not args.keep_temp:
+            selected_doc_path.unlink(missing_ok=True)
+            sft_pred_path.unlink(missing_ok=True)
+
+        round_summaries.append(
+            {
+                "round": round_idx,
+                "released": release_size,
+                "selected_count": len(selection["selected_docs"]),
+                "selection_metric": args.selection_metric,
+                "pool_eval_dir": str(pool_eval_dir),
+                "selection_meta": str(selection_meta_path),
+                "baseline_selection_predictions": str(baseline_pred_path),
+                "sft_ft_save_dir": str(sft_ft_save_dir),
+                "sft_ft_log_dir": str(sft_ft_log_dir),
+                "sft_ft_test_eval": str(sft_ft_eval_dir),
+                "sft_selected_eval": str(selected_eval_dir),
+                "sft_selected_predictions": str(sft_pred_path),
+                "dpo_save_dir": str(dpo_save_dir) if dpo_save_dir else None,
+                "dpo_log_dir": str(dpo_log_dir) if dpo_log_dir else None,
+                "dpo_test_eval": str(dpo_eval_dir) if dpo_eval_dir else None,
+                "preference_jsonl": str(preference_jsonl),
+                "workspace": str(round_dir),
+            }
+        )
+
+    summary = {
+        "baseline": baseline_summary,
+        "rounds": round_summaries,
+        "final_train_size": len(train_docs_cache),
+        "remaining_pool": len(pool_docs_cache),
+        "train_path": str(train_path),
+        "valid_path": str(valid_path),
+        "pool_path": str(pool_path),
     }
 
     summary_path = ACTIVE_DIR / f"active_learning_summary_{timestamp}.json"
     dump_json(summary_path, [summary], indent=2)
 
     print("\n=== Pipeline complete ===")
-    for key, value in summary.items():
-        print(f"{key}: {value}")
+    print(f"Baseline checkpoint: {baseline_summary['baseline_save_dir']}")
+    for round_summary in round_summaries:
+        print(
+            f"Round {round_summary['round']}: selected {round_summary['selected_count']} "
+            f"(released {round_summary['released']}); "
+            f"SFT eval log: {round_summary['sft_ft_test_eval']}"
+        )
+    print(f"Summary written to: {summary_path}")
 
 
 if __name__ == "__main__":
