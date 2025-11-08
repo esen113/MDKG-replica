@@ -1,12 +1,11 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
--f https://www.paddlepaddle.org.cn/whl/cu121
 
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
 torchaudio==2.5.1+cu121
 
 numpy==1.26.2
-scipy==1.16.3
+scipy==1.10.1
 scikit-learn==1.7.2
 pandas==2.0.3
 transformers==4.57.1
@@ -20,13 +19,6 @@ spacy==3.6.1
 scispacy==0.5.3
 en-core-sci-sm @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.3/en_core_sci_sm-0.5.3.tar.gz
 
-# 关键：去掉 .post121，用 -f 链接选择 cu121 轮子
-paddlepaddle-gpu==2.6.2
-paddleocr==2.6.1.3
-opencv-python==4.8.1.78
-PyMuPDF==1.23.9
-pdfplumber==0.10.3
-Pillow==10.1.0
 nltk==3.9.2
 tensorboardX==2.6.2.2
 jinja2==3.1.2

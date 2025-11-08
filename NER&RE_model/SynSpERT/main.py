@@ -46,6 +46,11 @@ NEG_RELATION_COUNT = 100
 TRAIN_LOG_ITER = 1
 SAVE_OPTIMIZER_ENABLED = False
 FINAL_EVAL_ENABLED = False
+FT_MODE = "sft"
+DPO_BETA = 0.1
+DPO_LAMBDA = 0.1
+DPO_NEGATIVES = 4
+DPO_REFERENCE: str | None = None
 
 
 def ensure_directories(extra_dir: Path | None = None):
@@ -177,6 +182,13 @@ def build_train_args() -> list:
         "--seed",
         str(SEED),
     ]
+    args_list.extend(["--ft_mode", FT_MODE])
+    if FT_MODE == "dpo":
+        args_list.extend(["--dpo_beta", str(DPO_BETA)])
+        args_list.extend(["--dpo_lambda", str(DPO_LAMBDA)])
+        args_list.extend(["--dpo_negatives", str(DPO_NEGATIVES)])
+        if DPO_REFERENCE:
+            args_list.extend(["--dpo_reference", str(DPO_REFERENCE)])
     if NOISE_LAMBDA is not None:
         args_list.extend(["--noise_lambda", str(NOISE_LAMBDA)])
     if TRAIN_LOG_ITER is not None:
@@ -350,6 +362,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_log_iter", type=int, default=TRAIN_LOG_ITER)
     parser.add_argument("--save_optimizer", action="store_true", default=SAVE_OPTIMIZER_ENABLED)
     parser.add_argument("--final_eval", action="store_true", default=FINAL_EVAL_ENABLED)
+    parser.add_argument("--ft_mode", choices=["sft", "dpo"], default=FT_MODE)
+    parser.add_argument("--dpo_beta", type=float, default=DPO_BETA)
+    parser.add_argument("--dpo_lambda", type=float, default=DPO_LAMBDA)
+    parser.add_argument("--dpo_negatives", type=int, default=DPO_NEGATIVES)
+    parser.add_argument("--dpo_reference", type=str, default=DPO_REFERENCE)
     return parser.parse_args()
 
 
@@ -358,6 +375,7 @@ def main():
     global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED, LOG_PATH, SAVE_PATH
     global TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, LEARNING_RATE, LR_WARMUP, WEIGHT_DECAY
     global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
+    global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE
     global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
 
     LOG_PATH = Path(args.log_path).expanduser().resolve()
@@ -387,6 +405,11 @@ def main():
     TRAIN_LOG_ITER = args.train_log_iter
     SAVE_OPTIMIZER_ENABLED = args.save_optimizer
     FINAL_EVAL_ENABLED = args.final_eval
+    FT_MODE = args.ft_mode
+    DPO_BETA = args.dpo_beta
+    DPO_LAMBDA = args.dpo_lambda
+    DPO_NEGATIVES = args.dpo_negatives
+    DPO_REFERENCE = args.dpo_reference
 
     if args.mode == "train":
         run_args = build_train_args()
