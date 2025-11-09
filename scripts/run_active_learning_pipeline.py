@@ -141,10 +141,29 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of active-learning rounds to execute.",
     )
     al.add_argument(
-        "--selection-metric",
-        choices=("entropy_sum", "entity_entropy", "relation_entropy"),
-        default="entropy_sum",
-        help="Metric used to rank pool samples.",
+        "--al-reinit-each-round",
+        action="store_true",
+        help="Reinitialize each AL SFT run from the original --bert-model instead of the previous checkpoint.",
+    )
+    al.add_argument(
+        "--selection-script",
+        default=str(REPO_ROOT / "Active_learning.py"),
+        help="Path to Active_learning.py used for selecting informative samples.",
+    )
+    al.add_argument("--selection-top-k", type=int, default=20, help="How many clusters to retain (Active_learning.py).")
+    al.add_argument(
+        "--selection-sample-per-group",
+        type=int,
+        default=10,
+        help="Samples taken per cluster when calling Active_learning.py.",
+    )
+    al.add_argument("--selection-beta", type=float, default=0.1, help="beta parameter passed to Active_learning.py.")
+    al.add_argument("--selection-gamma", type=float, default=0.1, help="gamma parameter passed to Active_learning.py.")
+    al.add_argument("--selection-ncentroids", type=int, default=20, help="Cluster count for Active_learning.py.")
+    al.add_argument(
+        "--selection-use-weights",
+        action="store_true",
+        help="Forward --use_weights to Active_learning.py for weighted clustering.",
     )
 
     misc = parser.add_argument_group("Misc")
@@ -454,49 +473,6 @@ def parse_eval_metrics(log_dir: Path) -> dict:
     return metrics
 
 
-def select_low_confidence_samples(
-    pool_path: Path,
-    predictions_path: Path,
-    entropy_entities: Path,
-    entropy_relations: Path,
-    count: int,
-    metric: str,
-) -> dict:
-    pool_docs = load_json(pool_path)
-    preds = load_json(predictions_path)
-    ent = torch.load(entropy_entities)
-    rel = torch.load(entropy_relations)
-
-    ent = ent.tolist()
-    rel = rel.tolist()
-
-    if not (len(pool_docs) == len(preds) == len(ent) == len(rel)):
-        raise PipelineError("Pool docs, predictions, and entropy tensors misaligned in length.")
-
-    def score(idx: int) -> float:
-        if metric == "entropy_sum":
-            return ent[idx] + rel[idx]
-        if metric == "entity_entropy":
-            return ent[idx]
-        return rel[idx]
-
-    scored = sorted(range(len(pool_docs)), key=score, reverse=True)
-    selected_indices = sorted(scored[: min(count, len(scored))])
-
-    selected_docs = [pool_docs[i] for i in selected_indices]
-    selected_preds = [preds[i] for i in selected_indices]
-    remaining_docs = [doc for idx, doc in enumerate(pool_docs) if idx not in set(selected_indices)]
-
-    return {
-        "selected_indices": selected_indices,
-        "selected_docs": selected_docs,
-        "selected_predictions": selected_preds,
-        "remaining_docs": remaining_docs,
-        "entity_entropy": [ent[i] for i in selected_indices],
-        "relation_entropy": [rel[i] for i in selected_indices],
-    }
-
-
 def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     kept = 0
@@ -640,51 +616,126 @@ def main() -> None:
             print(f"[AL] Round {round_idx}: no candidates available; stopping.")
             break
 
-        selection = select_low_confidence_samples(
-            pool_path=round_pool_path,
-            predictions_path=predictions_path,
-            entropy_entities=entropy_entities,
-            entropy_relations=entropy_relations,
-            count=actual_sample_count,
-            metric=args.selection_metric,
-        )
-
         selected_doc_path = round_dir / f"selected_docs_round{round_idx}.json"
         sft_pred_path = round_dir / f"selected_predictions_round{round_idx}_sft.json"
         baseline_pred_path = round_dir / f"selected_predictions_round{round_idx}_baseline.json"
         remaining_pool_path = round_dir / f"pool_remaining_round{round_idx}.json"
         selection_meta_path = round_dir / f"selection_round{round_idx}.json"
 
-        dump_json(selected_doc_path, selection["selected_docs"])
-        dump_json(baseline_pred_path, selection["selected_predictions"])
-        dump_json(remaining_pool_path, selection["remaining_docs"])
+        predictions = load_json(predictions_path)
+        entities_entropy_tensor = torch.load(entropy_entities)
+        relations_entropy_tensor = torch.load(entropy_relations)
+        entities_entropy = entities_entropy_tensor.view(-1).tolist()
+        relations_entropy = relations_entropy_tensor.view(-1).tolist()
+
+        if not (len(release_docs) == len(predictions) == len(entities_entropy) == len(relations_entropy)):
+            raise PipelineError("Pool docs, predictions, and entropy tensors misaligned in length.")
+
+        label_prediction_path = al_dump_dir / "label_prediction.pt"
+        pooler_output_path = al_dump_dir / "pooler_output.pt"
+        for required in (label_prediction_path, pooler_output_path):
+            if not required.exists():
+                raise PipelineError(f"Required AL tensor missing: {required}")
+
+        selection_prefix = f"round{round_idx}"
+        selection_script = Path(args.selection_script)
+        if not selection_script.exists():
+            raise PipelineError(f"Selection script not found: {selection_script}")
+
+        selection_cmd = [
+            "python",
+            str(selection_script),
+            "--dump_dir",
+            str(al_dump_dir),
+            "--unlabeled_json",
+            str(round_pool_path),
+            "--output_prefix",
+            selection_prefix,
+            "--top_k",
+            str(args.selection_top_k),
+            "--sample_per_group",
+            str(args.selection_sample_per_group),
+            "--beta",
+            str(args.selection_beta),
+            "--gamma",
+            str(args.selection_gamma),
+            "--ncentroids",
+            str(args.selection_ncentroids),
+        ]
+        if args.selection_use_weights:
+            selection_cmd.append("--use_weights")
+        run_command(selection_cmd, cwd=REPO_ROOT)
+
+        selection_indices_path = al_dump_dir / f"selected_indices_{selection_prefix}.pt"
+        sampling_json_path = al_dump_dir / f"sampling_json_{selection_prefix}.json"
+        sampling_text_path = al_dump_dir / f"sampling_text_{selection_prefix}.txt"
+        if not selection_indices_path.exists():
+            raise PipelineError(f"Selection indices not found: {selection_indices_path}")
+
+        all_selected_indices_tensor = torch.load(selection_indices_path)
+        all_selected_indices = [int(idx) for idx in all_selected_indices_tensor.tolist()]
+        if not all_selected_indices:
+            print(f"[WARN] Round {round_idx}: selection script returned no candidates; stopping.")
+            break
+
+        limited_indices = all_selected_indices[:actual_sample_count]
+        if not limited_indices:
+            print(f"[WARN] Round {round_idx}: no candidates selected after limiting; stopping.")
+            break
+
+        selected_docs = [release_docs[i] for i in limited_indices]
+        selected_predictions = [predictions[i] for i in limited_indices]
+        selected_entity_entropy = [entities_entropy[i] for i in limited_indices]
+        selected_relation_entropy = [relations_entropy[i] for i in limited_indices]
+
+        selected_idx_set = set(limited_indices)
+        remaining_docs = [doc for idx, doc in enumerate(release_docs) if idx not in selected_idx_set]
+
+        dump_json(selected_doc_path, selected_docs)
+        dump_json(baseline_pred_path, selected_predictions)
+        dump_json(remaining_pool_path, remaining_docs)
         dump_json(
             selection_meta_path,
             [
                 {
                     "index": idx,
-                    "orig_id": selection["selected_docs"][i].get("orig_id"),
-                    "entity_entropy": selection["entity_entropy"][i],
-                    "relation_entropy": selection["relation_entropy"][i],
+                    "orig_id": selected_docs[i].get("orig_id"),
+                    "entity_entropy": selected_entity_entropy[i],
+                    "relation_entropy": selected_relation_entropy[i],
                 }
-                for i, idx in enumerate(selection["selected_indices"])
+                for i, idx in enumerate(limited_indices)
             ],
         )
 
+        sampling_json_copied = None
+        sampling_text_copied = None
+        if sampling_json_path.exists():
+            sampling_json_copied = round_dir / sampling_json_path.name
+            shutil.copy2(sampling_json_path, sampling_json_copied)
+        if sampling_text_path.exists():
+            sampling_text_copied = round_dir / sampling_text_path.name
+            shutil.copy2(sampling_text_path, sampling_text_copied)
+
         # Reinsert unselected docs to the front of the remaining pool and persist split.
-        pool_docs_cache = selection["remaining_docs"] + pool_docs_cache
+        pool_docs_cache = remaining_docs + pool_docs_cache
         dump_json(pool_path, pool_docs_cache)
 
         # Merge selected samples into the supervised training set.
-        train_docs_cache = train_docs_cache + selection["selected_docs"]
+        train_docs_cache = train_docs_cache + selected_docs
         dump_json(train_path, train_docs_cache)
 
         # SFT fine-tuning on the expanded training set.
         sft_ft_seed = args.seed + 51 + round_idx
         sft_label_suffix = f"active_learning_sft_round{round_idx}"
+        if args.al_reinit_each_round:
+            sft_init_model = args.bert_model
+            print(f"[AL] Round {round_idx}: reinitializing SFT from '{sft_init_model}'.")
+        else:
+            sft_init_model = str(current_model)
+
         sft_ft_log_dir, sft_ft_save_dir = run_training(
             label_suffix=sft_label_suffix,
-            bert_model=str(current_model),
+            bert_model=sft_init_model,
             config_path=args.config,
             seed=sft_ft_seed,
             epochs=args.sft_ft_epochs,
@@ -758,8 +809,11 @@ def main() -> None:
             {
                 "round": round_idx,
                 "released": release_size,
-                "selected_count": len(selection["selected_docs"]),
-                "selection_metric": args.selection_metric,
+                "selected_count": len(selected_docs),
+                "selection_script": str(selection_script),
+                "selection_prefix": selection_prefix,
+                "selection_sampling_json": str(sampling_json_copied or sampling_json_path),
+                "selection_sampling_text": str(sampling_text_copied or sampling_text_path),
                 "pool_eval_dir": str(pool_eval_dir),
                 "selection_meta": str(selection_meta_path),
                 "baseline_selection_predictions": str(baseline_pred_path),
