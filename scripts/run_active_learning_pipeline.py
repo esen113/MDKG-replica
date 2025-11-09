@@ -768,7 +768,7 @@ def main() -> None:
         dump_json(sft_pred_path, sft_selected_predictions)
 
         preference_jsonl = round_dir / f"dpo_preferences_round{round_idx}.jsonl"
-        preference_count = build_dpo_preferences(selection["selected_docs"], sft_selected_predictions, preference_jsonl)
+        preference_count = build_dpo_preferences(selected_docs, sft_selected_predictions, preference_jsonl)
 
         dpo_save_dir = dpo_log_dir = dpo_eval_dir = None
         dpo_model = None
