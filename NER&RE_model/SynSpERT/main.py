@@ -51,6 +51,7 @@ DPO_BETA = 0.1
 DPO_LAMBDA = 0.1
 DPO_NEGATIVES = 4
 DPO_REFERENCE: str | None = None
+DPO_PREFERENCES: str | None = None
 
 
 def ensure_directories(extra_dir: Path | None = None):
@@ -189,6 +190,8 @@ def build_train_args() -> list:
         args_list.extend(["--dpo_negatives", str(DPO_NEGATIVES)])
         if DPO_REFERENCE:
             args_list.extend(["--dpo_reference", str(DPO_REFERENCE)])
+        if DPO_PREFERENCES:
+            args_list.extend(["--dpo_preferences", str(DPO_PREFERENCES)])
     if NOISE_LAMBDA is not None:
         args_list.extend(["--noise_lambda", str(NOISE_LAMBDA)])
     if TRAIN_LOG_ITER is not None:
@@ -367,6 +370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpo_lambda", type=float, default=DPO_LAMBDA)
     parser.add_argument("--dpo_negatives", type=int, default=DPO_NEGATIVES)
     parser.add_argument("--dpo_reference", type=str, default=DPO_REFERENCE)
+    parser.add_argument("--dpo_preferences", type=str, default=None)
     return parser.parse_args()
 
 
@@ -375,7 +379,7 @@ def main():
     global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED, LOG_PATH, SAVE_PATH
     global TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, LEARNING_RATE, LR_WARMUP, WEIGHT_DECAY
     global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
-    global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE
+    global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE, DPO_PREFERENCES
     global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
 
     LOG_PATH = Path(args.log_path).expanduser().resolve()
@@ -410,6 +414,7 @@ def main():
     DPO_LAMBDA = args.dpo_lambda
     DPO_NEGATIVES = args.dpo_negatives
     DPO_REFERENCE = args.dpo_reference
+    DPO_PREFERENCES = args.dpo_preferences
 
     if args.mode == "train":
         run_args = build_train_args()

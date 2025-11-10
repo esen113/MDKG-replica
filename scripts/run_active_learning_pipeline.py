@@ -35,6 +35,7 @@ Example (`python scripts/run_active_learning_pipeline.py`):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import re
@@ -314,6 +315,7 @@ def run_training(
     dpo_lambda: float = 0.1,
     dpo_negatives: int = 4,
     dpo_reference: str | None = None,
+    dpo_preferences: str | None = None,
 ) -> tuple[Path, Path]:
     print(f"[TRAIN] Starting training run '{label_suffix}'.")
     cmd = [
@@ -357,6 +359,8 @@ def run_training(
         )
         if dpo_reference:
             cmd.extend(["--dpo_reference", dpo_reference])
+        if dpo_preferences:
+            cmd.extend(["--dpo_preferences", dpo_preferences])
     run_command(cmd, cwd=REPO_ROOT)
     log_dir, save_dir = relocate_training_run(label_suffix)
     print(f"[TRAIN] Artifacts moved to {save_dir}")
@@ -482,31 +486,28 @@ def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path
             tokens = doc.get("tokens", [])
             prompt = "Extract entities and relations from the sentence:\n" + " ".join(tokens)
 
-            chosen = {
-                "entities": sorted(
-                    doc.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
-                ),
-                "relations": sorted(
-                    doc.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
-                ),
-            }
-            rejected = {
-                "entities": sorted(
-                    pred.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
-                ),
-                "relations": sorted(
-                    pred.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
-                ),
-            }
+            chosen_entities = sorted(
+                doc.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
+            )
+            chosen_relations = sorted(
+                doc.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
+            )
+            rejected_entities = sorted(
+                pred.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
+            )
+            rejected_relations = sorted(
+                pred.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
+            )
 
-            if chosen == rejected:
+            if chosen_entities == rejected_entities and chosen_relations == rejected_relations:
                 skipped += 1
                 continue
 
             record = {
                 "prompt": prompt,
-                "chosen": json.dumps(chosen, ensure_ascii=False, sort_keys=True),
-                "rejected": json.dumps(rejected, ensure_ascii=False, sort_keys=True),
+                "doc": copy.deepcopy(doc),
+                "rejected_entities": rejected_entities,
+                "rejected_relations": rejected_relations,
                 "orig_id": doc.get("orig_id"),
             }
             fout.write(json.dumps(record, ensure_ascii=False))
@@ -789,6 +790,7 @@ def main() -> None:
                 dpo_lambda=args.dpo_lambda,
                 dpo_negatives=args.dpo_negatives,
                 dpo_reference=str(sft_ft_model),
+                dpo_preferences=str(preference_jsonl),
             )
             dpo_model = final_model_path(dpo_save_dir)
             dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"

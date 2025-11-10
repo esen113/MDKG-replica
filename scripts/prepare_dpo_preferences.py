@@ -22,6 +22,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
+import copy
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,13 +142,18 @@ def main() -> None:
             tokens = human_doc.get("tokens", [])
 
             prompt = build_prompt(tokens, args.prompt_template)
-            chosen = serialise_annotation(tokens, human_doc.get("entities", []), human_doc.get("relations", []))
-            rejected = serialise_annotation(tokens, model_doc.get("entities", []), model_doc.get("relations", []))
+            rejected_entities = sorted(
+                model_doc.get("entities", []), key=lambda e: (e.get("start", 0), e.get("end", 0), e.get("type", ""))
+            )
+            rejected_relations = sorted(
+                model_doc.get("relations", []), key=lambda r: (r.get("head", 0), r.get("tail", 0), r.get("type", ""))
+            )
 
             record = {
                 "prompt": prompt,
-                "chosen": json.dumps(chosen, ensure_ascii=False, sort_keys=True),
-                "rejected": json.dumps(rejected, ensure_ascii=False, sort_keys=True),
+                "doc": copy.deepcopy(human_doc),
+                "rejected_entities": rejected_entities,
+                "rejected_relations": rejected_relations,
                 "orig_id": human_doc.get("orig_id"),
             }
             fout.write(json.dumps(record, ensure_ascii=False))
@@ -159,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

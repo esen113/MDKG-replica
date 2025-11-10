@@ -102,6 +102,8 @@ def get_argparser():
                             help="Number of negative classes sampled per example for DPO (entities/relations).")
     arg_parser.add_argument('--dpo_reference', type=str, default=None,
                             help="Path to reference checkpoint used for DPO comparisons. Defaults to model_path.")
+    arg_parser.add_argument('--dpo_preferences', type=str, default=None,
+                            help="Path to JSONL with human/model preference pairs used for DPO training.")
 
 #    _add_common_args(arg_parser)
 

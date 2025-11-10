@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 from torch.nn import DataParallel
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.optim import AdamW
 import transformers
@@ -29,6 +30,7 @@ from spert.entities import Dataset
 from spert.evaluator import Evaluator
 from spert.input_reader import JsonInputReader, BaseInputReader
 from spert.loss import SpERTLoss, Loss
+from spert.preference_dataset import PreferenceDataset, preference_collate_fn
 from tqdm import tqdm
 from spert.trainer import BaseTrainer
 import sys
@@ -48,6 +50,18 @@ class SpERTTrainer(BaseTrainer):
         self._tokenizer = BertTokenizer.from_pretrained(args.tokenizer_path,
                                                         do_lower_case=args.lowercase,
                                                         cache_dir=args.cache_path)
+        tokenizer_vocab_size = getattr(self._tokenizer, "vocab_size", None) or len(self._tokenizer)
+        config_vocab_size = getattr(self.config, "vocab_size", None)
+        if tokenizer_vocab_size is not None and tokenizer_vocab_size != config_vocab_size:
+            if hasattr(self, "_logger"):
+                self._logger.warning(
+                    "Tokenizer vocab_size (%s) != config vocab_size (%s); overriding config to keep checkpoint loading consistent.",
+                    tokenizer_vocab_size,
+                    config_vocab_size,
+                )
+            self.config.vocab_size = tokenizer_vocab_size
+        elif tokenizer_vocab_size is not None and config_vocab_size is None:
+            self.config.vocab_size = tokenizer_vocab_size
         # path to export predictions to
         self._predictions_path = os.path.join(self._log_path, 'predictions_%s_epoch_%s.json')
 
@@ -106,16 +120,48 @@ class SpERTTrainer(BaseTrainer):
         input_reader.read({train_label: train_path, valid_label: valid_path})
         self._log_datasets(input_reader)
 
-        
+        self._ft_mode = getattr(self.args, "ft_mode", "sft")
         train_dataset = input_reader.get_dataset(train_label)
-
-        
-        
-        train_sample_count = train_dataset.document_count
-        updates_epoch = train_sample_count // args.train_batch_size
-        updates_total = updates_epoch * args.epochs
-
         validation_dataset = input_reader.get_dataset(valid_label)
+
+        preference_loader = None
+        preference_dataset = None
+        preference_path = getattr(args, "dpo_preferences", None)
+        if self._ft_mode == "dpo" and preference_path:
+            try:
+                preference_dataset = PreferenceDataset(
+                    label=train_label,
+                    preference_path=preference_path,
+                    input_reader=input_reader,
+                    neg_entity_count=args.neg_entity_count,
+                    neg_relation_count=args.neg_relation_count,
+                    max_span_size=args.max_span_size,
+                )
+            except Exception as exc:
+                self._logger.warning(f"Failed to load DPO preferences '{preference_path}': {exc}")
+            else:
+                if len(preference_dataset) == 0:
+                    self._logger.warning("DPO preference dataset is empty; falling back to standard supervised loss.")
+                else:
+                    drop_last = len(preference_dataset) >= self.args.train_batch_size
+                    preference_loader = DataLoader(
+                        preference_dataset,
+                        batch_size=self.args.train_batch_size,
+                        shuffle=True,
+                        drop_last=drop_last,
+                        num_workers=self.args.sampling_processes,
+                        collate_fn=preference_collate_fn,
+                    )
+                    train_sample_count = len(preference_dataset)
+                    if drop_last:
+                        updates_epoch = max(train_sample_count // args.train_batch_size, 1)
+                    else:
+                        updates_epoch = max(math.ceil(train_sample_count / args.train_batch_size), 1)
+        if preference_loader is None:
+            train_sample_count = train_dataset.document_count
+            updates_epoch = max(train_sample_count // args.train_batch_size, 1)
+
+        updates_total = updates_epoch * args.epochs
 
         self._logger.info("Updates per epoch: %s" % updates_epoch)
         self._logger.info("Updates total: %s" % updates_total)
@@ -123,7 +169,6 @@ class SpERTTrainer(BaseTrainer):
         # create model
         model = self._load_pretrained_model(input_reader)
 
-        self._ft_mode = getattr(self.args, "ft_mode", "sft")
         self._ref_model = None
         if self._ft_mode == "dpo":
             ref_path = getattr(self.args, "dpo_reference", None) or self.args.model_path
@@ -196,6 +241,10 @@ class SpERTTrainer(BaseTrainer):
             dpo_lambda=getattr(self.args, "dpo_lambda", 0.1),
             dpo_negatives=getattr(self.args, "dpo_negatives", 4),
         )
+        self._entity_criterion = entity_criterion
+        self._rel_criterion = rel_criterion
+        self._preference_loader = preference_loader
+        self._preference_dataset = preference_dataset
 
         best_model = None #DKS
         best_rel_f1_micro=0
@@ -208,8 +257,11 @@ class SpERTTrainer(BaseTrainer):
 
         # train
         for epoch in range(args.epochs):
-            # train epoch
-            self._train_epoch(model, compute_loss, optimizer, train_dataset, updates_epoch, epoch)
+            if self._preference_loader is not None:
+                pref_label = getattr(self._preference_dataset, "label", train_label)
+                self._train_epoch_preference(model, optimizer, scheduler, self._preference_loader, epoch, pref_label)
+            else:
+                self._train_epoch(model, compute_loss, optimizer, train_dataset, updates_epoch, epoch)
 
             if skip_eval:
                 continue
@@ -327,7 +379,119 @@ class SpERTTrainer(BaseTrainer):
             if global_iteration % self.args.train_log_iter == 0:
                 self._log_train(optimizer, batch_loss, epoch, iteration, global_iteration, dataset.label)
 
-        return iteration
+    def _train_epoch_preference(
+        self,
+        model: torch.nn.Module,
+        optimizer: Optimizer,
+        scheduler,
+        data_loader: DataLoader,
+        epoch: int,
+        label: str,
+    ):
+        if len(data_loader) == 0:
+            self._logger.warning("Preference loader returned zero batches; skipping epoch.")
+            return
+
+        self._logger.info("Train epoch (DPO preferences): %s", epoch)
+        iteration = 0
+        total = len(data_loader)
+
+        for chosen_batch, rejected_batch in tqdm(data_loader, total=total, desc=f"DPO epoch {epoch}"):
+            model.train()
+            chosen_batch = util.to_device(chosen_batch, self._device)
+            rejected_batch = util.to_device(rejected_batch, self._device)
+
+            chosen_entity_logits, chosen_rel_logits = model(
+                encodings=chosen_batch["encodings"],
+                context_masks=chosen_batch["context_masks"],
+                entity_masks=chosen_batch["entity_masks"],
+                entity_sizes=chosen_batch["entity_sizes"],
+                relations=chosen_batch["rels"],
+                rel_masks=chosen_batch["rel_masks"],
+                dephead=chosen_batch["dephead"],
+                deplabel=chosen_batch["deplabel"],
+                pos=chosen_batch["pos"],
+            )
+            rejected_entity_logits, rejected_rel_logits = model(
+                encodings=rejected_batch["encodings"],
+                context_masks=rejected_batch["context_masks"],
+                entity_masks=rejected_batch["entity_masks"],
+                entity_sizes=rejected_batch["entity_sizes"],
+                relations=rejected_batch["rels"],
+                rel_masks=rejected_batch["rel_masks"],
+                dephead=rejected_batch["dephead"],
+                deplabel=rejected_batch["deplabel"],
+                pos=rejected_batch["pos"],
+            )
+
+            chosen_loss = self._preference_supervised_loss(chosen_entity_logits, chosen_rel_logits, chosen_batch)
+            rejected_loss = self._preference_supervised_loss(rejected_entity_logits, rejected_rel_logits, rejected_batch)
+
+            ref_term = 0.0
+            if self._ref_model is not None:
+                with torch.no_grad():
+                    ref_chosen_entity_logits, ref_chosen_rel_logits = self._ref_model(
+                        encodings=chosen_batch["encodings"],
+                        context_masks=chosen_batch["context_masks"],
+                        entity_masks=chosen_batch["entity_masks"],
+                        entity_sizes=chosen_batch["entity_sizes"],
+                        relations=chosen_batch["rels"],
+                        rel_masks=chosen_batch["rel_masks"],
+                        dephead=chosen_batch["dephead"],
+                        deplabel=chosen_batch["deplabel"],
+                        pos=chosen_batch["pos"],
+                    )
+                    ref_rejected_entity_logits, ref_rejected_rel_logits = self._ref_model(
+                        encodings=rejected_batch["encodings"],
+                        context_masks=rejected_batch["context_masks"],
+                        entity_masks=rejected_batch["entity_masks"],
+                        entity_sizes=rejected_batch["entity_sizes"],
+                        relations=rejected_batch["rels"],
+                        rel_masks=rejected_batch["rel_masks"],
+                        dephead=rejected_batch["dephead"],
+                        deplabel=rejected_batch["deplabel"],
+                        pos=rejected_batch["pos"],
+                    )
+                    ref_chosen_loss = self._preference_supervised_loss(
+                        ref_chosen_entity_logits, ref_chosen_rel_logits, chosen_batch
+                    )
+                    ref_rejected_loss = self._preference_supervised_loss(
+                        ref_rejected_entity_logits, ref_rejected_rel_logits, rejected_batch
+                    )
+                    ref_term = (ref_rejected_loss - ref_chosen_loss).item()
+
+            d = self.args.dpo_beta * ((rejected_loss - chosen_loss) - ref_term)
+            dpo_loss = self.args.dpo_lambda * F.softplus(-d)
+
+            dpo_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            model.zero_grad()
+
+            iteration += 1
+            global_iteration = epoch * total + iteration
+            self._log_train(optimizer, float(dpo_loss.detach()), epoch, iteration, global_iteration, label)
+
+    def _preference_supervised_loss(self, entity_logits, rel_logits, batch):
+        entity_logits = entity_logits.view(-1, entity_logits.shape[-1])
+        entity_types = batch["entity_types"].view(-1)
+        entity_masks = batch["entity_sample_masks"].view(-1).float()
+        entity_losses = self._entity_criterion(entity_logits, entity_types)
+        entity_den = torch.clamp(entity_masks.sum(), min=1.0)
+        entity_loss = (entity_losses * entity_masks).sum() / entity_den
+
+        rel_sample_masks = batch["rel_sample_masks"].view(-1).float()
+        rel_loss = torch.zeros_like(entity_loss)
+        rel_count = rel_sample_masks.sum()
+        if rel_count.item() != 0:
+            rel_logits = rel_logits.view(-1, rel_logits.shape[-1])
+            rel_types = batch["rel_types"].view(-1, batch["rel_types"].shape[-1])
+            rel_loss_raw = self._rel_criterion(rel_logits, rel_types)
+            rel_loss_raw = rel_loss_raw.sum(-1) / rel_loss_raw.shape[-1]
+            rel_loss = (rel_loss_raw * rel_sample_masks).sum() / rel_count
+
+        return 1.2 * entity_loss + rel_loss
 
     def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInputReader,
               epoch: int = 0, updates_epoch: int = 0, iteration: int = 0):
