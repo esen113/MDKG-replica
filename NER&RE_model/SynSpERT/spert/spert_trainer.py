@@ -424,10 +424,10 @@ class SpERTTrainer(BaseTrainer):
                 pos=rejected_batch["pos"],
             )
 
-            chosen_loss = self._preference_supervised_loss(chosen_entity_logits, chosen_rel_logits, chosen_batch)
-            rejected_loss = self._preference_supervised_loss(rejected_entity_logits, rejected_rel_logits, rejected_batch)
+            chosen_logp = self._preference_log_prob(chosen_entity_logits, chosen_rel_logits, chosen_batch)
+            rejected_logp = self._preference_log_prob(rejected_entity_logits, rejected_rel_logits, rejected_batch)
 
-            ref_term = 0.0
+            ref_margin = torch.zeros_like(chosen_logp)
             if self._ref_model is not None:
                 with torch.no_grad():
                     ref_chosen_entity_logits, ref_chosen_rel_logits = self._ref_model(
@@ -452,16 +452,17 @@ class SpERTTrainer(BaseTrainer):
                         deplabel=rejected_batch["deplabel"],
                         pos=rejected_batch["pos"],
                     )
-                    ref_chosen_loss = self._preference_supervised_loss(
+                    ref_chosen_logp = self._preference_log_prob(
                         ref_chosen_entity_logits, ref_chosen_rel_logits, chosen_batch
                     )
-                    ref_rejected_loss = self._preference_supervised_loss(
+                    ref_rejected_logp = self._preference_log_prob(
                         ref_rejected_entity_logits, ref_rejected_rel_logits, rejected_batch
                     )
-                    ref_term = (ref_rejected_loss - ref_chosen_loss).item()
+                    ref_margin = ref_chosen_logp - ref_rejected_logp
 
-            d = self.args.dpo_beta * ((rejected_loss - chosen_loss) - ref_term)
-            dpo_loss = self.args.dpo_lambda * F.softplus(-d)
+            policy_margin = chosen_logp - rejected_logp
+            d = self.args.dpo_beta * (policy_margin - ref_margin)
+            dpo_loss = self.args.dpo_lambda * F.softplus(-d).mean()
 
             dpo_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
@@ -473,25 +474,37 @@ class SpERTTrainer(BaseTrainer):
             global_iteration = epoch * total + iteration
             self._log_train(optimizer, float(dpo_loss.detach()), epoch, iteration, global_iteration, label)
 
-    def _preference_supervised_loss(self, entity_logits, rel_logits, batch):
-        entity_logits = entity_logits.view(-1, entity_logits.shape[-1])
+    def _preference_log_prob(self, entity_logits, rel_logits, batch):
+        entity_lp = self._entity_log_prob(entity_logits, batch)
+        rel_lp = self._relation_log_prob(rel_logits, batch)
+        return 1.2 * entity_lp + rel_lp
+
+    def _entity_log_prob(self, entity_logits, batch):
+        batch_size = entity_logits.shape[0]
+        logits_flat = entity_logits.view(-1, entity_logits.shape[-1])
         entity_types = batch["entity_types"].view(-1)
-        entity_masks = batch["entity_sample_masks"].view(-1).float()
-        entity_losses = self._entity_criterion(entity_logits, entity_types)
-        entity_den = torch.clamp(entity_masks.sum(), min=1.0)
-        entity_loss = (entity_losses * entity_masks).sum() / entity_den
+        entity_losses = self._entity_criterion(logits_flat, entity_types)
+        entity_losses = entity_losses.view(batch_size, -1)
+        entity_masks = batch["entity_sample_masks"].view(batch_size, -1).float()
+        neg_log_likelihood = (entity_losses * entity_masks).sum(dim=1)
+        return -neg_log_likelihood
 
-        rel_sample_masks = batch["rel_sample_masks"].view(-1).float()
-        rel_loss = torch.zeros_like(entity_loss)
-        rel_count = rel_sample_masks.sum()
-        if rel_count.item() != 0:
-            rel_logits = rel_logits.view(-1, rel_logits.shape[-1])
-            rel_types = batch["rel_types"].view(-1, batch["rel_types"].shape[-1])
-            rel_loss_raw = self._rel_criterion(rel_logits, rel_types)
-            rel_loss_raw = rel_loss_raw.sum(-1) / rel_loss_raw.shape[-1]
-            rel_loss = (rel_loss_raw * rel_sample_masks).sum() / rel_count
+    def _relation_log_prob(self, rel_logits, batch):
+        batch_size = batch["rel_sample_masks"].shape[0]
+        if rel_logits is None:
+            return torch.zeros(batch_size, device=self._device)
 
-        return 1.2 * entity_loss + rel_loss
+        rel_sample_masks = batch["rel_sample_masks"].view(batch_size, -1).float()
+        if rel_sample_masks.sum().item() == 0:
+            return torch.zeros(batch_size, device=self._device)
+
+        logits_flat = rel_logits.view(-1, rel_logits.shape[-1])
+        rel_types = batch["rel_types"].view(-1, batch["rel_types"].shape[-1])
+        rel_loss_raw = self._rel_criterion(logits_flat, rel_types)
+        rel_loss_raw = rel_loss_raw.view(batch_size, -1, rel_loss_raw.shape[-1])
+        rel_loss_raw = rel_loss_raw.sum(dim=-1) / rel_loss_raw.shape[-1]
+        rel_neg_log_likelihood = (rel_loss_raw * rel_sample_masks).sum(dim=1)
+        return -rel_neg_log_likelihood
 
     def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInputReader,
               epoch: int = 0, updates_epoch: int = 0, iteration: int = 0):
@@ -668,3 +681,4 @@ class SpERTTrainer(BaseTrainer):
                                                  'rel_nec_prec_micro', 'rel_nec_rec_micro', 'rel_nec_f1_micro',
                                                  'rel_nec_prec_macro', 'rel_nec_rec_macro', 'rel_nec_f1_macro',
                                                  'epoch', 'iteration', 'global_iteration']})
+
