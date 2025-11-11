@@ -3,21 +3,26 @@
 """
 One-click MDKG active-learning + DPO demo.
 
-Pipeline overview (multi-round AL):
+Pipeline overview (multi-round AL with fixed SFT base):
   1. (Optional) create GPU-ready Conda env and install dependencies.
   2. Download MDIEC annotations from Hugging Face if missing.
-  3. Convert `.ann/.txt` files into SynSpERT JSON and split counts
-     (default: 300 train / 150 eval / remainder pool).
-  4. Train a baseline SynSpERT model (SFT) on the base training split and
-     evaluate on the held-out validation/test set.
-  5. For each active-learning round:
-       a. Expose a batch of pool samples, run eval with AL tensors,并挑出
-          `--al-sample-count` 个低置信度样本。
-       b. 把新样本并入训练集，以上一轮 checkpoint warm-start 做 SFT 微调，
-          同时在固定测试集和该批新样本上各评估一次。
-       c. 用“人工标注 vs 最新 SFT 推理”构造偏好对（仅保留仍有差异的样本），
-          可选跑一段 DPO，然后在测试集评估。
-       d. 记录当轮所有 artifact，并把未被选中的样本放回池子，继续下一轮。
+  3. Convert `.ann/.txt` files into SynSpERT JSON and split the corpus into
+     (i) SFT base subset, (ii) reserved DPO seed subset, (iii) validation/test,
+     and (iv) an unlabeled pool released gradually.
+  4. Train a baseline SynSpERT model (SFT) on the base subset and evaluate on
+     the held-out validation/test split.
+  5. Build an initial DPO preference set by contrasting the frozen SFT base
+     predictions against the reserved DPO seed subset, then fine-tune via DPO
+     to obtain Active-Chat (AC) model #1.
+  6. For each active-learning round:
+       a. Expose a batch of pool samples, score with the latest AC model, and
+          retain `--al-sample-count` informative samples via clustering.
+       b. Append the newly “labeled” samples to the DPO dataset, regenerate
+          preference pairs with the frozen SFT base predictions, and keep an
+          ever-growing JSONL archive.
+       c. Run a fresh DPO fine-tune (default: re-init from the round0 SFT base)
+          on the accumulated preferences to produce the next AC model.
+       d. Log all artifacts, return unselected samples to the pool, and repeat.
 
 Artifacts are stored under `NER&RE_model/InputsAndOutputs/data/active_learning/`.
 
@@ -95,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         default=150,
         help="Number of documents reserved as the fixed validation/test set.",
     )
+    data.add_argument(
+        "--initial-dpo-count",
+        type=int,
+        default=300,
+        help="Number of documents held out from SFT to seed the first DPO fine-tune.",
+    )
     data.add_argument("--prefix", default=DEFAULT_PREFIX, help="Dataset prefix (defaults to SynSpERT's diabetes).")
 
     train = parser.add_argument_group("Training")
@@ -121,6 +132,12 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--dpo-beta", type=float, default=0.1, help="DPO beta temperature.")
     train.add_argument("--dpo-lambda", type=float, default=0.1, help="Weight applied to the DPO loss term.")
     train.add_argument("--dpo-negatives", type=int, default=4, help="Negative classes sampled per example for DPO.")
+    train.add_argument(
+        "--dpo-init-mode",
+        choices=("base", "latest"),
+        default="base",
+        help="Checkpoint used to initialize/reference each DPO run ('base' uses the round0 SFT model).",
+    )
 
     al = parser.add_argument_group("Active learning")
     al.add_argument(
@@ -212,7 +229,13 @@ def download_data() -> None:
     run_command(["python", str(REPO_ROOT / "scripts" / "fetch_official_data.py"), "--overwrite"], cwd=REPO_ROOT)
 
 
-def generate_synspert_inputs(train_count: int, valid_count: int, prefix: str, seed: int) -> None:
+def generate_synspert_inputs(
+    train_count: int,
+    valid_count: int,
+    prefix: str,
+    seed: int,
+    initial_dpo_count: int,
+) -> None:
     print("[DATA] Converting Brat annotations to SynSpERT JSON.")
     run_command(
         [
@@ -229,36 +252,54 @@ def generate_synspert_inputs(train_count: int, valid_count: int, prefix: str, se
     print("[DATA] Shuffling corpus and creating custom splits.")
     docs = load_json(DATASET_JSON)
     total = len(docs)
-    if train_count + valid_count >= total:
+    if train_count + valid_count + initial_dpo_count >= total:
         raise PipelineError(
-            f"Requested train ({train_count}) + valid ({valid_count}) consumes entire dataset of {total} documents."
+            "Requested train ({train_count}) + valid ({valid_count}) + initial_dpo ({initial_dpo_count}) "
+            f"consumes entire dataset of {total} documents.".format(
+                train_count=train_count, valid_count=valid_count, initial_dpo_count=initial_dpo_count
+            )
         )
 
     rng = random.Random(seed)
     rng.shuffle(docs)
 
     train_docs = docs[:train_count]
-    valid_docs = docs[train_count : train_count + valid_count]
-    pool_docs = docs[train_count + valid_count :]
+    dpo_seed_docs = docs[train_count : train_count + initial_dpo_count]
+    valid_docs = docs[train_count + initial_dpo_count : train_count + initial_dpo_count + valid_count]
+    pool_docs = docs[train_count + initial_dpo_count + valid_count :]
 
     SPLIT_DIR.mkdir(parents=True, exist_ok=True)
     dump_json(SPLIT_DIR / f"{prefix}_train.json", train_docs)
     dump_json(SPLIT_DIR / f"{prefix}_valid.json", valid_docs)
     dump_json(SPLIT_DIR / f"{prefix}_test.json", pool_docs)
+    dump_json(SPLIT_DIR / f"{prefix}_dpo_seed.json", dpo_seed_docs)
+    dump_json(SPLIT_DIR / f"{prefix}_dpo_all.json", dpo_seed_docs)
 
     print(
-        f"[DATA] Split complete: train={len(train_docs)}, valid/test={len(valid_docs)}, pool={len(pool_docs)} "
-        f"(seed={seed})."
+        "[DATA] Split complete: train={train}, initial_dpo={dpo}, valid/test={valid}, pool={pool} "
+        "(seed={seed}).".format(
+            train=len(train_docs),
+            dpo=len(dpo_seed_docs),
+            valid=len(valid_docs),
+            pool=len(pool_docs),
+            seed=seed,
+        )
     )
 
 
-def dataset_paths(prefix: str) -> tuple[Path, Path, Path]:
+def dataset_paths(prefix: str) -> tuple[Path, Path, Path, Path, Path]:
     train = SPLIT_DIR / f"{prefix}_train.json"
     valid = SPLIT_DIR / f"{prefix}_valid.json"
     test = SPLIT_DIR / f"{prefix}_test.json"
-    if not train.exists() or not valid.exists() or not test.exists():
-        raise PipelineError(f"Expected SynSpERT splits not found for prefix '{prefix}'.")
-    return train, valid, test
+    dpo_seed = SPLIT_DIR / f"{prefix}_dpo_seed.json"
+    dpo_all = SPLIT_DIR / f"{prefix}_dpo_all.json"
+    missing = [path for path in (train, valid, test, dpo_seed, dpo_all) if not path.exists()]
+    if missing:
+        raise PipelineError(
+            f"Expected SynSpERT splits not found for prefix '{prefix}': "
+            + ", ".join(str(path) for path in missing)
+        )
+    return train, valid, test, dpo_seed, dpo_all
 
 
 def latest_run_dir(base_dir: Path) -> Path:
@@ -424,6 +465,18 @@ def dump_json(path: Path, data: Iterable, indent: int = 2) -> None:
     path.write_text(json.dumps(list(data), ensure_ascii=False, indent=indent))
 
 
+def append_jsonl(src: Path, dest: Path) -> None:
+    if not src.exists():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("r", encoding="utf-8") as fin, dest.open("a", encoding="utf-8") as fout:
+        for raw_line in fin:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            fout.write(line + "\n")
+
+
 def parse_eval_metrics(log_dir: Path) -> dict:
     log_path = log_dir / "all.log"
     if not log_path.exists():
@@ -524,6 +577,20 @@ def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path
     return kept
 
 
+def resolve_dpo_init(
+    init_mode: str,
+    base_model: Path,
+    current_model: Path,
+) -> tuple[str, str]:
+    if init_mode == "base":
+        reference = base_model
+    elif init_mode == "latest":
+        reference = current_model
+    else:
+        raise PipelineError(f"Unsupported --dpo-init-mode value: {init_mode}")
+    return str(reference), str(reference)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -533,20 +600,26 @@ def main() -> None:
     if not args.skip_download:
         download_data()
 
-    generate_synspert_inputs(args.train_count, args.valid_count, args.prefix, args.seed)
-    train_path, valid_path, pool_path = dataset_paths(args.prefix)
+    generate_synspert_inputs(
+        args.train_count,
+        args.valid_count,
+        args.prefix,
+        args.seed,
+        args.initial_dpo_count,
+    )
+    train_path, valid_path, pool_path, dpo_seed_path, dpo_all_path = dataset_paths(args.prefix)
 
     ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
     round0_dir = ACTIVE_DIR / "round0"
     round0_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Backup initial splits for reference.
     shutil.copy2(train_path, round0_dir / f"{args.prefix}_train_round0_{timestamp}.json")
     shutil.copy2(valid_path, round0_dir / f"{args.prefix}_test_round0_{timestamp}.json")
     shutil.copy2(pool_path, round0_dir / f"{args.prefix}_pool_round0_{timestamp}.json")
+    shutil.copy2(dpo_seed_path, round0_dir / f"{args.prefix}_dpo_seed_round0_{timestamp}.json")
+    shutil.copy2(dpo_all_path, round0_dir / f"{args.prefix}_dpo_all_round0_{timestamp}.json")
 
-    # Baseline SFT training.
     base_log_dir, base_save_dir = run_training(
         label_suffix="active_learning_sft_round0",
         bert_model=args.bert_model,
@@ -560,7 +633,6 @@ def main() -> None:
     )
     base_model = final_model_path(base_save_dir)
 
-    # Evaluate baseline on held-out test split.
     test_eval_dir = run_evaluation(
         model_dir=base_model,
         dataset_path=valid_path,
@@ -576,8 +648,78 @@ def main() -> None:
 
     train_docs_cache = load_json(train_path)
     pool_docs_cache = load_json(pool_path)
+    dpo_seed_docs = load_json(dpo_seed_path)
+    dpo_docs_cache = load_json(dpo_all_path)
     round_summaries: list[dict] = []
+
+    preference_archive = ACTIVE_DIR / f"dpo_preferences_accum_{timestamp}.jsonl"
+    total_preference_count = 0
     current_model = base_model
+
+    seed_pref_path = round0_dir / f"dpo_preferences_seed_round0_{timestamp}.jsonl"
+    seed_pref_count = 0
+    if dpo_seed_docs:
+        seed_eval_label = "active_learning_dpo_seed_round0_baseline"
+        seed_eval_dir = run_evaluation(
+            model_dir=base_model,
+            dataset_path=dpo_seed_path,
+            label=seed_eval_label,
+            eval_batch=args.eval_batch_size,
+        )
+        seed_pred_path = seed_eval_dir / "predictions_test_epoch_0.json"
+        seed_predictions = load_json(seed_pred_path)
+        seed_pref_count = build_dpo_preferences(dpo_seed_docs, seed_predictions, seed_pref_path)
+    else:
+        seed_pref_path.touch()
+
+    if seed_pref_count > 0:
+        shutil.copy2(seed_pref_path, preference_archive)
+        total_preference_count = seed_pref_count
+    else:
+        preference_archive.touch(exist_ok=True)
+
+    initial_dpo_log_dir = initial_dpo_save_dir = initial_dpo_eval_dir = None
+    if seed_pref_count > 0 and args.dpo_epochs > 0:
+        dpo_init_model, dpo_reference_model = resolve_dpo_init(
+            args.dpo_init_mode, base_model, current_model
+        )
+        dpo_seed_label_suffix = "active_learning_dpo_seed_round0"
+        initial_dpo_log_dir, initial_dpo_save_dir = run_training(
+            label_suffix=dpo_seed_label_suffix,
+            bert_model=dpo_init_model,
+            config_path=args.config,
+            seed=args.seed + 101,
+            epochs=args.dpo_epochs,
+            lr=args.dpo_learning_rate,
+            train_batch=args.train_batch_size,
+            eval_batch=args.eval_batch_size,
+            ft_mode="dpo",
+            dpo_beta=args.dpo_beta,
+            dpo_lambda=args.dpo_lambda,
+            dpo_negatives=args.dpo_negatives,
+            dpo_reference=dpo_reference_model,
+            dpo_preferences=str(preference_archive),
+        )
+        current_model = final_model_path(initial_dpo_save_dir)
+        initial_dpo_eval_dir = run_evaluation(
+            model_dir=current_model,
+            dataset_path=valid_path,
+            label="active_learning_eval_dpo_seed_round0",
+            eval_batch=args.eval_batch_size,
+        )
+    elif seed_pref_count == 0:
+        print("[WARN] Initial DPO stage skipped: no preference pairs from the seed subset.")
+    else:
+        print("[WARN] Initial DPO stage skipped because --dpo-epochs=0.")
+
+    initial_dpo_summary = {
+        "preference_jsonl": str(seed_pref_path),
+        "preference_archive": str(preference_archive),
+        "preference_count": seed_pref_count,
+        "dpo_log_dir": str(initial_dpo_log_dir) if initial_dpo_log_dir else None,
+        "dpo_save_dir": str(initial_dpo_save_dir) if initial_dpo_save_dir else None,
+        "dpo_eval_dir": str(initial_dpo_eval_dir) if initial_dpo_eval_dir else None,
+    }
 
     for round_idx in range(1, args.max_rounds + 1):
         if not pool_docs_cache:
@@ -717,70 +859,42 @@ def main() -> None:
             sampling_text_copied = round_dir / sampling_text_path.name
             shutil.copy2(sampling_text_path, sampling_text_copied)
 
-        # Reinsert unselected docs to the front of the remaining pool and persist split.
         pool_docs_cache = remaining_docs + pool_docs_cache
         dump_json(pool_path, pool_docs_cache)
 
-        # Merge selected samples into the supervised training set.
-        train_docs_cache = train_docs_cache + selected_docs
-        dump_json(train_path, train_docs_cache)
+        dpo_docs_cache.extend(selected_docs)
+        dump_json(dpo_all_path, dpo_docs_cache)
 
-        # SFT fine-tuning on the expanded training set.
-        sft_ft_seed = args.seed + 51 + round_idx
-        sft_label_suffix = f"active_learning_sft_round{round_idx}"
-        if args.al_reinit_each_round:
-            sft_init_model = args.bert_model
-            print(f"[AL] Round {round_idx}: reinitializing SFT from '{sft_init_model}'.")
-        else:
-            sft_init_model = str(current_model)
-
-        sft_ft_log_dir, sft_ft_save_dir = run_training(
-            label_suffix=sft_label_suffix,
-            bert_model=sft_init_model,
-            config_path=args.config,
-            seed=sft_ft_seed,
-            epochs=args.sft_ft_epochs,
-            lr=args.sft_ft_learning_rate,
-            train_batch=args.train_batch_size,
-            eval_batch=args.eval_batch_size,
-            ft_mode="sft",
-        )
-        sft_ft_model = final_model_path(sft_ft_save_dir)
-        current_model = sft_ft_model
-
-        sft_eval_label = f"active_learning_eval_sft_round{round_idx}"
-        sft_ft_eval_dir = run_evaluation(
-            model_dir=sft_ft_model,
-            dataset_path=valid_path,
-            label=sft_eval_label,
-            eval_batch=args.eval_batch_size,
-        )
-        selected_eval_label = f"active_learning_selected_sft_round{round_idx}"
-        selected_eval_dir = run_evaluation(
-            model_dir=sft_ft_model,
+        baseline_selected_eval_label = f"active_learning_baseline_selected_round{round_idx}"
+        baseline_selected_eval_dir = run_evaluation(
+            model_dir=base_model,
             dataset_path=selected_doc_path,
-            label=selected_eval_label,
+            label=baseline_selected_eval_label,
             eval_batch=args.eval_batch_size,
         )
-        sft_selected_pred_path = selected_eval_dir / "predictions_test_epoch_0.json"
-        if not sft_selected_pred_path.exists():
-            raise PipelineError(f"SFT predictions for selected docs not found: {sft_selected_pred_path}")
-        sft_selected_predictions = load_json(sft_selected_pred_path)
-        dump_json(sft_pred_path, sft_selected_predictions)
+        baseline_selected_pred_path = baseline_selected_eval_dir / "predictions_test_epoch_0.json"
+        baseline_selected_predictions = load_json(baseline_selected_pred_path)
+        dump_json(sft_pred_path, baseline_selected_predictions)
 
         preference_jsonl = round_dir / f"dpo_preferences_round{round_idx}.jsonl"
-        preference_count = build_dpo_preferences(selected_docs, sft_selected_predictions, preference_jsonl)
+        preference_count = build_dpo_preferences(selected_docs, baseline_selected_predictions, preference_jsonl)
+        if preference_count > 0:
+            append_jsonl(preference_jsonl, preference_archive)
+            total_preference_count += preference_count
+        else:
+            print(f"[WARN] Round {round_idx}: no preference pairs generated from selected docs.")
 
-        dpo_save_dir = dpo_log_dir = dpo_eval_dir = None
-        dpo_model = None
+        dpo_log_dir = dpo_save_dir = dpo_eval_dir = None
         if preference_count > 0 and args.dpo_epochs > 0:
-            dpo_seed = args.seed + 101 + round_idx
+            dpo_init_model, dpo_reference_model = resolve_dpo_init(
+                args.dpo_init_mode, base_model, current_model
+            )
             dpo_label_suffix = f"active_learning_dpo_round{round_idx}"
             dpo_log_dir, dpo_save_dir = run_training(
                 label_suffix=dpo_label_suffix,
-                bert_model=str(sft_ft_model),
+                bert_model=dpo_init_model,
                 config_path=args.config,
-                seed=dpo_seed,
+                seed=args.seed + 101 + round_idx,
                 epochs=args.dpo_epochs,
                 lr=args.dpo_learning_rate,
                 train_batch=args.train_batch_size,
@@ -789,19 +903,21 @@ def main() -> None:
                 dpo_beta=args.dpo_beta,
                 dpo_lambda=args.dpo_lambda,
                 dpo_negatives=args.dpo_negatives,
-                dpo_reference=str(sft_ft_model),
-                dpo_preferences=str(preference_jsonl),
+                dpo_reference=dpo_reference_model,
+                dpo_preferences=str(preference_archive),
             )
-            dpo_model = final_model_path(dpo_save_dir)
+            current_model = final_model_path(dpo_save_dir)
             dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
             dpo_eval_dir = run_evaluation(
-                model_dir=dpo_model,
+                model_dir=current_model,
                 dataset_path=valid_path,
                 label=dpo_eval_label,
                 eval_batch=args.eval_batch_size,
             )
         elif preference_count == 0:
-            print(f"[WARN] Round {round_idx}: no DPO pairs; skipping DPO fine-tuning.")
+            pass
+        else:
+            print(f"[WARN] Round {round_idx}: DPO epochs set to 0; skipping fine-tuning.")
 
         if not args.keep_temp:
             selected_doc_path.unlink(missing_ok=True)
@@ -818,28 +934,32 @@ def main() -> None:
                 "selection_sampling_text": str(sampling_text_copied or sampling_text_path),
                 "pool_eval_dir": str(pool_eval_dir),
                 "selection_meta": str(selection_meta_path),
-                "baseline_selection_predictions": str(baseline_pred_path),
-                "sft_ft_save_dir": str(sft_ft_save_dir),
-                "sft_ft_log_dir": str(sft_ft_log_dir),
-                "sft_ft_test_eval": str(sft_ft_eval_dir),
-                "sft_selected_eval": str(selected_eval_dir),
-                "sft_selected_predictions": str(sft_pred_path),
-                "dpo_save_dir": str(dpo_save_dir) if dpo_save_dir else None,
-                "dpo_log_dir": str(dpo_log_dir) if dpo_log_dir else None,
-                "dpo_test_eval": str(dpo_eval_dir) if dpo_eval_dir else None,
+                "ac_selection_predictions": str(baseline_pred_path),
+                "base_selection_eval": str(baseline_selected_eval_dir),
+                "base_selection_predictions": str(sft_pred_path),
                 "preference_jsonl": str(preference_jsonl),
+                "preference_count": preference_count,
+                "preference_archive": str(preference_archive),
+                "dpo_log_dir": str(dpo_log_dir) if dpo_log_dir else None,
+                "dpo_save_dir": str(dpo_save_dir) if dpo_save_dir else None,
+                "dpo_eval_dir": str(dpo_eval_dir) if dpo_eval_dir else None,
                 "workspace": str(round_dir),
             }
         )
 
     summary = {
         "baseline": baseline_summary,
+        "initial_dpo": initial_dpo_summary,
         "rounds": round_summaries,
         "final_train_size": len(train_docs_cache),
+        "dpo_dataset_size": len(dpo_docs_cache),
         "remaining_pool": len(pool_docs_cache),
         "train_path": str(train_path),
         "valid_path": str(valid_path),
         "pool_path": str(pool_path),
+        "dpo_all_path": str(dpo_all_path),
+        "preference_archive": str(preference_archive),
+        "total_preferences": total_preference_count,
     }
 
     summary_path = ACTIVE_DIR / f"active_learning_summary_{timestamp}.json"
@@ -847,15 +967,16 @@ def main() -> None:
 
     print("\n=== Pipeline complete ===")
     print(f"Baseline checkpoint: {baseline_summary['baseline_save_dir']}")
+    if initial_dpo_summary.get("dpo_save_dir"):
+        print(f"Initial AC checkpoint: {initial_dpo_summary['dpo_save_dir']}")
     for round_summary in round_summaries:
         print(
             f"Round {round_summary['round']}: selected {round_summary['selected_count']} "
             f"(released {round_summary['released']}); "
-            f"SFT eval log: {round_summary['sft_ft_test_eval']}"
+            f"DPO eval log: {round_summary.get('dpo_eval_dir')}"
         )
+    print(f"Preference archive ({total_preference_count} pairs): {preference_archive}")
     print(f"Summary written to: {summary_path}")
-
-
 if __name__ == "__main__":
     try:
         main()
