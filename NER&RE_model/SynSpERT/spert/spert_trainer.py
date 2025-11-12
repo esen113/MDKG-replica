@@ -191,8 +191,10 @@ class SpERTTrainer(BaseTrainer):
         
         model.to(self._device)
 
+        is_dpo_mode = getattr(self, "_ft_mode", "sft") == "dpo"
+
         # DPO stays strictly comparable with its reference; skip noise / reinit
-        if getattr(self, "_ft_mode", "sft") != "dpo":
+        if not is_dpo_mode:
             for name, para in model.named_parameters():
                 model.state_dict()[name][:] += (
                     (torch.rand(para.size()).to(self._device) - 0.5)
@@ -219,13 +221,14 @@ class SpERTTrainer(BaseTrainer):
             unfold_layer(model)
             return layers
 
-        for layer in get_layers(model.bert.encoder.layer[-1]):
-            if isinstance(layer, (nn.Linear)):
-                nn.init.xavier_uniform_(layer.weight)
+        if not is_dpo_mode:
+            for layer in get_layers(model.bert.encoder.layer[-1]):
+                if isinstance(layer, (nn.Linear)):
+                    nn.init.xavier_uniform_(layer.weight)
 
-        for layer in get_layers(model.bert.pooler):
-            if isinstance(layer, (nn.Linear)):
-                nn.init.xavier_uniform_(layer.weight)
+            for layer in get_layers(model.bert.pooler):
+                if isinstance(layer, (nn.Linear)):
+                    nn.init.xavier_uniform_(layer.weight)
 
         # create optimizer
         optimizer_params = self._get_optimizer_params(model)
@@ -514,13 +517,13 @@ class SpERTTrainer(BaseTrainer):
         if rel_sample_masks.sum().item() == 0:
             return torch.zeros(batch_size, device=self._device)
 
-        logits_flat = rel_logits.view(-1, rel_logits.shape[-1])
-        rel_types = batch["rel_types"].view(-1, batch["rel_types"].shape[-1])
-        rel_loss_raw = self._rel_criterion(logits_flat, rel_types)
-        rel_loss_raw = rel_loss_raw.view(batch_size, -1, rel_loss_raw.shape[-1])
-        rel_loss_raw = rel_loss_raw.sum(dim=-1) / rel_loss_raw.shape[-1]
-        rel_neg_log_likelihood = (rel_loss_raw * rel_sample_masks).sum(dim=1)
-        return -rel_neg_log_likelihood
+        rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_types"], reduction="none")
+        pos_mask = (batch["rel_types"] > 0.5).float()
+        mask = rel_sample_masks.view(batch_size, -1, 1)
+        pos_mask = pos_mask * mask
+        pos_count = pos_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        pos_nll = (rel_bce * pos_mask).sum(dim=(1, 2)) / pos_count
+        return -pos_nll
 
     def _eval(self, model: torch.nn.Module, dataset: Dataset, input_reader: JsonInputReader,
               epoch: int = 0, updates_epoch: int = 0, iteration: int = 0):
