@@ -110,6 +110,12 @@ class SpERTTrainer(BaseTrainer):
         self._logger.info("Datasets: %s, %s" % (train_path, valid_path))
         self._logger.info("Model type: %s" % args.model_type)
 
+        self._ft_mode = getattr(args, "ft_mode", "sft")
+        if self._ft_mode == "dpo":
+            # Freeze candidate sampling knobs for DPO runs
+            args.neg_entity_count = 0
+            args.neg_relation_count = 0
+
         # create log csv files
         self._init_train_logging(train_label)
         self._init_eval_logging(valid_label)
@@ -120,7 +126,6 @@ class SpERTTrainer(BaseTrainer):
         input_reader.read({train_label: train_path, valid_label: valid_path})
         self._log_datasets(input_reader)
 
-        self._ft_mode = getattr(self.args, "ft_mode", "sft")
         train_dataset = input_reader.get_dataset(train_label)
         validation_dataset = input_reader.get_dataset(valid_label)
 
@@ -186,11 +191,14 @@ class SpERTTrainer(BaseTrainer):
         
         model.to(self._device)
 
-
-
-        for name, para in model.named_parameters():
-            model.state_dict()[name][:] += (torch.rand(para.size()).to(self._device) - 0.5) * self.args.noise_lambda * torch.std(
-                para).to(self._device)
+        # DPO stays strictly comparable with its reference; skip noise / reinit
+        if getattr(self, "_ft_mode", "sft") != "dpo":
+            for name, para in model.named_parameters():
+                model.state_dict()[name][:] += (
+                    (torch.rand(para.size()).to(self._device) - 0.5)
+                    * self.args.noise_lambda
+                    * torch.std(para).to(self._device)
+                )
 
         def get_layers(model):
             layers = []
@@ -401,6 +409,11 @@ class SpERTTrainer(BaseTrainer):
             chosen_batch = util.to_device(chosen_batch, self._device)
             rejected_batch = util.to_device(rejected_batch, self._device)
 
+            if iteration < 5:
+                for key in ("entity_sample_masks", "rel_sample_masks", "rels"):
+                    cb, rb = chosen_batch[key], rejected_batch[key]
+                    assert cb.shape == rb.shape and torch.equal(cb, rb), f"DPO misaligned: {key}"
+
             chosen_entity_logits, chosen_rel_logits = model(
                 encodings=chosen_batch["encodings"],
                 context_masks=chosen_batch["context_masks"],
@@ -461,7 +474,10 @@ class SpERTTrainer(BaseTrainer):
                     ref_margin = ref_chosen_logp - ref_rejected_logp
 
             policy_margin = chosen_logp - rejected_logp
-            d = self.args.dpo_beta * (policy_margin - ref_margin)
+            delta = policy_margin - ref_margin
+            delta = (delta - delta.mean()) / delta.std(unbiased=False).clamp_min(1e-6)
+            d = self.args.dpo_beta * delta
+            d = d.clamp(-20.0, 20.0)
             dpo_loss = self.args.dpo_lambda * F.softplus(-d).mean()
 
             dpo_loss.backward()
@@ -681,4 +697,3 @@ class SpERTTrainer(BaseTrainer):
                                                  'rel_nec_prec_micro', 'rel_nec_rec_micro', 'rel_nec_f1_micro',
                                                  'rel_nec_prec_macro', 'rel_nec_rec_macro', 'rel_nec_f1_macro',
                                                  'epoch', 'iteration', 'global_iteration']})
-

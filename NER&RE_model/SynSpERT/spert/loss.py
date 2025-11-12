@@ -222,24 +222,46 @@ class SpERTLoss(Loss):
 
         mask_flat = masks.view(-1).bool()
         labels_flat = labels.view(-1, labels.shape[-1])
-        positive_mask = mask_flat & (labels_flat.sum(-1) > 0)
-        if positive_mask.sum() == 0:
+        keep = mask_flat & (labels_flat.sum(-1) > 0)
+        if keep.sum() == 0:
             return None
 
-        logits_flat = logits.view(-1, logits.shape[-1])[positive_mask]
-        ref_logits_flat = ref_logits.view(-1, ref_logits.shape[-1])[positive_mask]
-        gold_indices = labels_flat.argmax(-1)[positive_mask]
+        logits_flat = logits.view(-1, logits.shape[-1])[keep]
+        ref_logits_flat = ref_logits.view(-1, ref_logits.shape[-1])[keep]
+        pos_mask = labels_flat[keep] > 0.5
 
-        negatives, valid_mask = _sample_negatives(logits_flat, gold_indices, self._dpo_negatives)
-        if negatives is None:
+        masked_for_neg = logits_flat.masked_fill(pos_mask, float("-inf"))
+        k = min(self._dpo_negatives, logits_flat.size(1) - 1)
+        if k <= 0:
             return None
 
-        return _dpo_multi_neg_loss(
-            logits_flat,
-            ref_logits_flat,
-            gold_indices,
-            negatives,
-            self._dpo_beta,
-            valid_mask,
+        neg_vals, y_negs = torch.topk(masked_for_neg, k, dim=-1)
+        valid_neg_mask = torch.isfinite(neg_vals)
+
+        row_idx, pos_idx = torch.where(pos_mask)
+        if row_idx.numel() == 0:
+            return None
+
+        pos_t = logits_flat[row_idx, pos_idx].unsqueeze(1)
+        pos_r = ref_logits_flat[row_idx, pos_idx].unsqueeze(1)
+
+        counts = pos_mask.sum(dim=1).to(torch.long)
+        if counts.sum() == 0:
+            return None
+
+        rep_idx = torch.repeat_interleave(
+            torch.arange(pos_mask.size(0), device=logits_flat.device),
+            counts,
         )
 
+        neg_idx_exp = y_negs[rep_idx]
+        valid_exp = valid_neg_mask[rep_idx]
+        neg_t = logits_flat.gather(1, neg_idx_exp)
+        neg_r = ref_logits_flat.gather(1, neg_idx_exp)
+
+        d = self._dpo_beta * ((pos_t - neg_t) - (pos_r - neg_r))
+        loss_mat = F.softplus(-d)
+        loss_mat = loss_mat.masked_select(valid_exp)
+        if loss_mat.numel() == 0:
+            return None
+        return loss_mat.mean()

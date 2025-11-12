@@ -246,6 +246,143 @@ def create_eval_sample(doc, max_span_size: int):
                 dephead= dephead, deplabel=deplabel, pos =pos)
 
 
+def build_candidate_blueprint(doc, input_reader, max_span_size: int, relation_type_count: int):
+    """
+    Build a deterministic candidate set per document without attaching labels.
+    """
+    encodings = torch.tensor(doc.encoding, dtype=torch.long)
+    context_size = len(doc.encoding)
+    context_masks = torch.ones(context_size, dtype=torch.bool)
+
+    dephead, deplabel, pos = add_syntax_info(doc, context_size)
+
+    entity_spans = []
+    entity_masks = []
+    entity_sizes = []
+
+    token_count = len(doc.tokens)
+    for size in range(1, max_span_size + 1):
+        limit = token_count - size + 1
+        if limit <= 0:
+            continue
+        for i in range(limit):
+            span = doc.tokens[i:i + size].span
+            entity_spans.append(span)
+            entity_masks.append(create_entity_mask(*span, context_size))
+            entity_sizes.append(size)
+
+    if entity_masks:
+        entity_masks_tensor = torch.stack(entity_masks)
+        entity_sizes_tensor = torch.tensor(entity_sizes, dtype=torch.long)
+        entity_spans_tensor = torch.tensor(entity_spans, dtype=torch.long)
+        entity_sample_masks = torch.ones([entity_masks_tensor.shape[0]], dtype=torch.bool)
+    else:
+        entity_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        entity_sizes_tensor = torch.zeros([1], dtype=torch.long)
+        entity_spans_tensor = torch.zeros([1, 2], dtype=torch.long)
+        entity_sample_masks = torch.zeros([1], dtype=torch.bool)
+        entity_spans = [(0, 0)]
+
+    rels = []
+    rel_masks = []
+    span_count = len(entity_spans)
+    if span_count > 1:
+        for i, s1 in enumerate(entity_spans):
+            for j, s2 in enumerate(entity_spans):
+                if i == j:
+                    continue
+                rels.append((i, j))
+                rel_masks.append(create_rel_mask(s1, s2, context_size))
+
+    if rels:
+        rels_tensor = torch.tensor(rels, dtype=torch.long)
+        rel_masks_tensor = torch.stack(rel_masks)
+        rel_sample_masks = torch.ones([rels_tensor.shape[0]], dtype=torch.bool)
+    else:
+        rels_tensor = torch.zeros([1, 2], dtype=torch.long)
+        rel_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        rel_sample_masks = torch.zeros([1], dtype=torch.bool)
+
+    return dict(
+        encodings=encodings,
+        context_masks=context_masks,
+        entity_masks=entity_masks_tensor,
+        entity_sizes=entity_sizes_tensor,
+        entity_spans=entity_spans_tensor,
+        rels=rels_tensor,
+        rel_masks=rel_masks_tensor,
+        entity_sample_masks=entity_sample_masks,
+        rel_sample_masks=rel_sample_masks,
+        dephead=dephead,
+        deplabel=deplabel,
+        pos=pos,
+    )
+
+
+def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
+    """
+    Attach entity/relation labels to a pre-computed blueprint.
+    """
+    entity_spans = bp["entity_spans"]
+    num_spans = entity_spans.shape[0]
+    entity_types = torch.zeros(num_spans, dtype=torch.long)
+    span_lookup = {tuple(span.tolist()): idx for idx, span in enumerate(entity_spans.tolist())}
+
+    if hasattr(doc, "entities"):
+        for entity in getattr(doc, "entities", []):
+            idx = span_lookup.get((entity.span_start, entity.span_end))
+            if idx is not None:
+                entity_types[idx] = entity.entity_type.index
+    else:
+        for entity in doc.get("entities", []):
+            idx = span_lookup.get((entity["start"], entity["end"]))
+            if idx is not None:
+                ent_type = input_reader.entity_types[entity["type"]].index
+                entity_types[idx] = ent_type
+
+    rel_type_dim = max(relation_type_count - 1, 0)
+    rel_indices = bp["rels"]
+    rel_types = torch.zeros(rel_indices.shape[0], rel_type_dim, dtype=torch.float32)
+    if rel_type_dim == 0 or int(bp["entity_sample_masks"].sum()) == 0 or rel_indices.shape[0] == 0:
+        return entity_types, rel_types
+
+    span_count = num_spans
+
+    def _pair_index(head_idx: int, tail_idx: int):
+        if head_idx == tail_idx or span_count <= 1:
+            return None
+        offset = tail_idx if tail_idx < head_idx else tail_idx - 1
+        return head_idx * (span_count - 1) + offset
+
+    if hasattr(doc, "relations"):
+        for rel in getattr(doc, "relations", []):
+            head_idx = span_lookup.get((rel.head_entity.span_start, rel.head_entity.span_end))
+            tail_idx = span_lookup.get((rel.tail_entity.span_start, rel.tail_entity.span_end))
+            if head_idx is None or tail_idx is None:
+                continue
+            pair_idx = _pair_index(head_idx, tail_idx)
+            if pair_idx is None or pair_idx >= rel_types.shape[0]:
+                continue
+            rel_type_idx = rel.relation_type.index - 1
+            if 0 <= rel_type_idx < rel_type_dim:
+                rel_types[pair_idx, rel_type_idx] = 1.0
+    else:
+        for rel in doc.get("relations", []):
+            head_idx = span_lookup.get((rel["head_start"], rel["head_end"]))
+            tail_idx = span_lookup.get((rel["tail_start"], rel["tail_end"]))
+            if head_idx is None or tail_idx is None:
+                continue
+            pair_idx = _pair_index(head_idx, tail_idx)
+            if pair_idx is None or pair_idx >= rel_types.shape[0]:
+                continue
+            rel_meta = input_reader.relation_types[rel["type"]]
+            rel_type_idx = rel_meta.index - 1
+            if 0 <= rel_type_idx < rel_type_dim:
+                rel_types[pair_idx, rel_type_idx] = 1.0
+
+    return entity_types, rel_types
+
+
 def create_entity_mask(start, end, context_size):
     mask = torch.zeros(context_size, dtype=torch.bool)
     mask[start:end] = 1

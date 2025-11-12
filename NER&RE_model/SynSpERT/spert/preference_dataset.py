@@ -40,9 +40,16 @@ class PreferenceDataset(TorchDataset):
         )
         self._negative_dataset._input_reader = input_reader  # type: ignore[attr-defined]
 
+        self._input_reader = input_reader
         self._load_preferences(Path(preference_path))
         self._positive_docs = self._positive_dataset.documents
         self._negative_docs = self._negative_dataset.documents
+        self._blueprints = []
+        for doc in self._positive_docs:
+            bp = sampling.build_candidate_blueprint(
+                doc, input_reader, max_span_size, self._relation_type_count
+            )
+            self._blueprints.append(bp)
 
     def _load_preferences(self, path: Path) -> None:
         if not path.exists():
@@ -79,21 +86,24 @@ class PreferenceDataset(TorchDataset):
         return len(self._positive_docs)
 
     def __getitem__(self, idx: int) -> Dict[str, Dict[str, Any]]:
+        blueprint = self._blueprints[idx]
         chosen_doc = self._positive_docs[idx]
         rejected_doc = self._negative_docs[idx]
 
-        chosen_sample = sampling.create_train_sample(
-            chosen_doc, self._neg_entity_count, self._neg_relation_count, self._max_span_size, self._relation_type_count
+        pos_ent, pos_rel = sampling.attach_labels_to_blueprint(
+            blueprint, chosen_doc, self._input_reader, self._relation_type_count
         )
-        rejected_sample = sampling.create_train_sample(
-            rejected_doc,
-            self._neg_entity_count,
-            self._neg_relation_count,
-            self._max_span_size,
-            self._relation_type_count,
+        neg_ent, neg_rel = sampling.attach_labels_to_blueprint(
+            blueprint, rejected_doc, self._input_reader, self._relation_type_count
         )
 
-        return {"chosen": chosen_sample, "rejected": rejected_sample}
+        def assemble(entity_types, rel_types):
+            sample = {k: v for k, v in blueprint.items()}
+            sample["entity_types"] = entity_types
+            sample["rel_types"] = rel_types
+            return sample
+
+        return {"chosen": assemble(pos_ent, pos_rel), "rejected": assemble(neg_ent, neg_rel)}
 
 
 def preference_collate_fn(batch: List[Dict[str, Dict[str, Any]]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:

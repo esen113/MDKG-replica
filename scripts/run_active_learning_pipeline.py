@@ -398,6 +398,14 @@ def run_training(
                 str(dpo_negatives),
             ]
         )
+        cmd.extend(
+            [
+                "--neg_entity_count",
+                "0",
+                "--neg_relation_count",
+                "0",
+            ]
+        )
         if dpo_reference:
             cmd.extend(["--dpo_reference", dpo_reference])
         if dpo_preferences:
