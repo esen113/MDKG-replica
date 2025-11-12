@@ -247,10 +247,6 @@ class SpERTTrainer(BaseTrainer):
             optimizer,
             scheduler,
             args.max_grad_norm,
-            ft_mode=getattr(self.args, "ft_mode", "sft"),
-            dpo_beta=getattr(self.args, "dpo_beta", 0.1),
-            dpo_lambda=getattr(self.args, "dpo_lambda", 0.1),
-            dpo_negatives=getattr(self.args, "dpo_negatives", 4),
         )
         self._entity_criterion = entity_criterion
         self._rel_criterion = rel_criterion
@@ -359,29 +355,11 @@ class SpERTTrainer(BaseTrainer):
                                               relations=batch['rels'], rel_masks=batch['rel_masks'],
                                               dephead= batch['dephead'], deplabel =batch['deplabel'], pos= batch['pos'])
 
-            ref_entity_logits = None
-            ref_rel_logits = None
-            if getattr(self, "_ft_mode", "sft") == "dpo" and self._ref_model is not None:
-                with torch.no_grad():
-                    ref_entity_logits, ref_rel_logits = self._ref_model(
-                        encodings=batch['encodings'],
-                        context_masks=batch['context_masks'],
-                        entity_masks=batch['entity_masks'],
-                        entity_sizes=batch['entity_sizes'],
-                        relations=batch['rels'],
-                        rel_masks=batch['rel_masks'],
-                        dephead=batch['dephead'],
-                        deplabel=batch['deplabel'],
-                        pos=batch['pos'],
-                    )
-
             # compute loss and optimize parameters
             batch_loss = compute_loss.compute(entity_logits=entity_logits, rel_logits=rel_logits,
                                               rel_types=batch['rel_types'], entity_types=batch['entity_types'],
                                               entity_sample_masks=batch['entity_sample_masks'],
-                                              rel_sample_masks=batch['rel_sample_masks'],
-                                              ref_entity_logits=ref_entity_logits,
-                                              ref_rel_logits=ref_rel_logits)
+                                              rel_sample_masks=batch['rel_sample_masks'])
 
             # logging
             iteration += 1
