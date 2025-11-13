@@ -47,6 +47,7 @@ TRAIN_LOG_ITER = 1
 SAVE_OPTIMIZER_ENABLED = False
 FINAL_EVAL_ENABLED = False
 FT_MODE = "sft"
+DPO_TRAIN_BATCH_SIZE: int | None = None
 DPO_BETA = 0.1
 DPO_LAMBDA = 0.1
 DPO_NEGATIVES = 4
@@ -188,6 +189,8 @@ def build_train_args() -> list:
         args_list.extend(["--dpo_beta", str(DPO_BETA)])
         args_list.extend(["--dpo_lambda", str(DPO_LAMBDA)])
         args_list.extend(["--dpo_negatives", str(DPO_NEGATIVES)])
+        if DPO_TRAIN_BATCH_SIZE is not None:
+            args_list.extend(["--dpo_train_batch_size", str(DPO_TRAIN_BATCH_SIZE)])
         if DPO_REFERENCE:
             args_list.extend(["--dpo_reference", str(DPO_REFERENCE)])
         if DPO_PREFERENCES:
@@ -366,6 +369,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_optimizer", action="store_true", default=SAVE_OPTIMIZER_ENABLED)
     parser.add_argument("--final_eval", action="store_true", default=FINAL_EVAL_ENABLED)
     parser.add_argument("--ft_mode", choices=["sft", "dpo"], default=FT_MODE)
+    parser.add_argument("--dpo_train_batch_size", type=int, default=None,
+                        help="Batch size used for DPO preference loader; defaults to --train_batch_size.")
     parser.add_argument("--dpo_beta", type=float, default=DPO_BETA)
     parser.add_argument("--dpo_lambda", type=float, default=DPO_LAMBDA)
     parser.add_argument("--dpo_negatives", type=int, default=DPO_NEGATIVES)
@@ -379,7 +384,7 @@ def main():
     global BERT_MODEL, CONFIG_PATH, CONFIG_OVERRIDE_SET, SEED, LOG_PATH, SAVE_PATH
     global TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, LEARNING_RATE, LR_WARMUP, WEIGHT_DECAY
     global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
-    global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE, DPO_PREFERENCES
+    global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE, DPO_PREFERENCES, DPO_TRAIN_BATCH_SIZE
     global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
 
     LOG_PATH = Path(args.log_path).expanduser().resolve()
@@ -410,6 +415,7 @@ def main():
     SAVE_OPTIMIZER_ENABLED = args.save_optimizer
     FINAL_EVAL_ENABLED = args.final_eval
     FT_MODE = args.ft_mode
+    DPO_TRAIN_BATCH_SIZE = args.dpo_train_batch_size
     DPO_BETA = args.dpo_beta
     DPO_LAMBDA = args.dpo_lambda
     DPO_NEGATIVES = args.dpo_negatives

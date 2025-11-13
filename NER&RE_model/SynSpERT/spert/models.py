@@ -153,6 +153,7 @@ class SpERT(BertPreTrainedModel):
         self._relation_types = relation_types
         self._entity_types = entity_types
         self._max_pairs = max_pairs
+        self.rel_chunk_size = int(getattr(config, "rel_chunk_size", 1024))
 
         # weight initialization
         self.init_weights()
@@ -182,14 +183,15 @@ class SpERT(BertPreTrainedModel):
         #print("### _classify_entities  hlarge.shape = ", hlarge.shape)
         m = (entity_masks.unsqueeze(-1) == 0).float() * (-1e30)  #torch.Size([10, 105, 40, 1])
 
-        entity_spans_pool = m + hlarge.unsqueeze(1).repeat(1, entity_masks.shape[1], 1, 1) #torch.Size([10, 105, 40, 768])
+        entity_spans_pool = m + hlarge.unsqueeze(1).expand(-1, entity_masks.shape[1], -1, -1) #torch.Size([10, 105, 40, 768])
 
         entity_spans_pool = entity_spans_pool.max(dim=2)[0]
         # print("#### entity_spans_pool maxooled .shape = ", entity_spans_pool.shape)
 
         entity_ctx = get_token(h, encodings, self._cls_token)
         
-        entity_repr = torch.cat([entity_ctx.unsqueeze(1).repeat(1, entity_spans_pool.shape[1], 1),
+        entity_ctx_exp = entity_ctx.unsqueeze(1).expand(-1, entity_spans_pool.shape[1], -1)
+        entity_repr = torch.cat([entity_ctx_exp,
                                  entity_spans_pool, size_embeddings], dim=2)
         entity_repr = self.dropout(entity_repr)
 
@@ -198,85 +200,86 @@ class SpERT(BertPreTrainedModel):
 
         return entity_clf, entity_spans_pool
     
-    def _classify_relations(self, entity_spans, size_embeddings, 
-                            relations, rel_masks, h, chunk_start,
-                            entity_clf = None, hlarge1=None):
+    def _classify_relations(self, entity_spans, size_embeddings,
+                            relations, rel_masks, context_tensor, chunk_start,
+                            entity_clf=None):
         batch_size = relations.shape[0]
+        if relations.shape[1] == 0:
+            return context_tensor.new_zeros((batch_size, 0, self._relation_types))
 
-        # create chunks if necessary
-        # print("#### relations.shape = ", relations.shape)
-        if (hlarge1 == None):
-            hlarge1 = h
-        if relations.shape[1] > self._max_pairs:
-            relations = relations[:, chunk_start:chunk_start + self._max_pairs]
-            rel_masks = rel_masks[:, chunk_start:chunk_start + self._max_pairs]
-            hlarge1 = hlarge1[:, :relations.shape[1], :]
+        ctx = context_tensor
+        pair_end = min(chunk_start + self._max_pairs, relations.shape[1])
+        rel_slice = relations[:, chunk_start:pair_end]
+        mask_slice = rel_masks[:, chunk_start:pair_end]
 
+        if rel_slice.shape[1] == 0:
+            return context_tensor.new_zeros((batch_size, 0, self._relation_types))
 
-        
-        entity_pairs = util.batch_index(entity_spans, relations)
-        entity_pairs = entity_pairs.view(batch_size, entity_pairs.shape[1], -1)
+        entity_clf_repr = None
+        if entity_clf is not None and (self._use_entity_clf in {"logits", "softmax", "onehot"}):
+            entity_clf_repr = entity_clf
+            if self._use_entity_clf == "softmax":
+                entity_clf_repr = torch.softmax(entity_clf_repr, dim=-1)
+            elif self._use_entity_clf == "onehot":
+                dim = entity_clf_repr.shape[-1]
+                entity_clf_repr = torch.nn.functional.one_hot(entity_clf_repr.argmax(dim=-1), dim).float()
 
-        # get corresponding size embeddings
-        size_pair_embeddings = util.batch_index(size_embeddings, relations)
-        size_pair_embeddings = size_pair_embeddings.view(batch_size, size_pair_embeddings.shape[1], -1)
+        rel_chunk = getattr(self, "rel_chunk_size", None)
+        if rel_chunk is None or rel_chunk <= 0:
+            rel_chunk = rel_slice.shape[1]
 
-        # relation context (context between entity candidate pair)
-        # mask non entity candidate tokens
-        m = ((rel_masks == 0).float() * (-1e30)).unsqueeze(-1)
-        #rel_ctx = m + h
-        #print("#### m.shape = ", m.shape)
-        rel_ctx =  m + hlarge1
-        # max pooling
-        rel_ctx = rel_ctx.max(dim=2)[0]
-        # set the context vector of neighboring or adjacent entity candidates to zero
-        rel_ctx[rel_masks.to(torch.uint8).any(-1) == 0] = 0
+        logits_per_chunk = []
+        for chunk_start_idx in range(0, rel_slice.shape[1], rel_chunk):
+            chunk_end_idx = min(chunk_start_idx + rel_chunk, rel_slice.shape[1])
+            rel_chunk_indices = rel_slice[:, chunk_start_idx:chunk_end_idx]
+            mask_chunk = mask_slice[:, chunk_start_idx:chunk_end_idx]
+            pair_count = rel_chunk_indices.shape[1]
+            if pair_count == 0:
+                continue
 
-        # create relation candidate representations including context, max pooled entity candidate pairs
-        # and corresponding size embeddings
-        rel_repr = torch.cat([rel_ctx, entity_pairs, size_pair_embeddings], dim=2)
+            entity_pairs = util.batch_index(entity_spans, rel_chunk_indices)
+            entity_pairs = entity_pairs.view(batch_size, pair_count, -1)
 
-        
-        #print("###### Rel rep.shape = ", rel_repr.shape, ", entity_clf.shape = ", entity_clf.shape)
-        
-        #DKS
-        if (entity_clf != None):
-         if (self._use_entity_clf == "logits" or self._use_entity_clf == "softmax" 
-                                              or self._use_entity_clf == "onehot"):
-            if (self._use_entity_clf == "softmax"):
+            size_pair_embeddings = util.batch_index(size_embeddings, rel_chunk_indices)
+            size_pair_embeddings = size_pair_embeddings.view(batch_size, pair_count, -1)
 
-                entity_clf = torch.softmax(entity_clf, dim=-1)
+            mask_float = (mask_chunk == 0).float().unsqueeze(-1) * (-1e30)
+            ctx_expanded = ctx.unsqueeze(1).expand(-1, pair_count, -1, -1)
+            rel_ctx = (mask_float + ctx_expanded).max(dim=2)[0]
+            mask_bool = mask_chunk.to(torch.bool)
+            rel_ctx[~mask_bool.any(-1)] = 0
 
-                
-            elif (self._use_entity_clf == "onehot"):
-                #print("########## entity_clf shape = ", entity_clf.shape)
-                dim = entity_clf.shape[-1]
-                entity_clf = torch.argmax(entity_clf, dim=-1)
-                entity_clf = torch.nn.functional.one_hot(entity_clf, dim) # get entity type (including none)
-            #Following lines execute if self._use_entity_clf is one of "logits", "softmax", "onehot"   
-            entity_clf_pairs =  util.batch_index(entity_clf, relations)
-            entity_clf_pairs =  entity_clf_pairs.view(batch_size, entity_clf_pairs.shape[1], -1)
-            rel_repr = torch.cat([ rel_repr, entity_clf_pairs], dim=2)
-        
-        if getattr(self, "use_dist_emb", False):
-            dist = rel_masks.long().sum(-1)
-            bins = torch.bucketize(dist, self.dist_cutoffs)
-            dist_vec = self.dist_emb(bins)
-            rel_repr = torch.cat([rel_repr, dist_vec], dim=2)
+            rel_repr = torch.cat([rel_ctx, entity_pairs, size_pair_embeddings], dim=2)
 
-        rel_repr = self.dropout(rel_repr)
-        if getattr(self, "use_biaffine", False) and self.biaffine is not None:
-            span_dim2 = entity_pairs.size(-1) // 2
-            h1 = entity_pairs[..., :span_dim2]
-            h2 = entity_pairs[..., span_dim2:]
-            bi = self.biaffine(h1, h2)
-            lin = self._run_rel_classifier(rel_repr)
-            if bi.dim() == 3 and bi.size(-1) == 1:
-                bi = bi.expand_as(lin)
-            chunk_rel_logits = bi + lin
-        else:
-            chunk_rel_logits = self._run_rel_classifier(rel_repr)
-        return chunk_rel_logits
+            if entity_clf_repr is not None:
+                entity_clf_pairs = util.batch_index(entity_clf_repr, rel_chunk_indices)
+                entity_clf_pairs = entity_clf_pairs.view(batch_size, pair_count, -1)
+                rel_repr = torch.cat([rel_repr, entity_clf_pairs], dim=2)
+
+            if getattr(self, "use_dist_emb", False):
+                dist = mask_chunk.long().sum(-1)
+                bins = torch.bucketize(dist, self.dist_cutoffs)
+                dist_vec = self.dist_emb(bins)
+                rel_repr = torch.cat([rel_repr, dist_vec], dim=2)
+
+            rel_repr = self.dropout(rel_repr)
+            if getattr(self, "use_biaffine", False) and self.biaffine is not None:
+                span_dim2 = entity_pairs.size(-1) // 2
+                h1 = entity_pairs[..., :span_dim2]
+                h2 = entity_pairs[..., span_dim2:]
+                bi = self.biaffine(h1, h2)
+                lin = self._run_rel_classifier(rel_repr)
+                if bi.dim() == 3 and bi.size(-1) == 1:
+                    bi = bi.expand_as(lin)
+                logits = bi + lin
+            else:
+                logits = self._run_rel_classifier(rel_repr)
+
+            logits_per_chunk.append(logits)
+
+        if logits_per_chunk:
+            return torch.cat(logits_per_chunk, dim=1)
+        return context_tensor.new_zeros((batch_size, 0, self._relation_types))
 
 
 
@@ -395,10 +398,7 @@ class SynSpERT(SpERT):
                                         entity_masks, size_embeddings, pos, hlarge1)
 
         # classify relations
-        h_large = h.unsqueeze(1).repeat(1, max(min(relations.shape[1], self._max_pairs), 1), 1, 1)
-        hlarge2 = None
-        if (self._use_pos):
-           hlarge2 = hlarge1.unsqueeze(1).repeat(1, max(min(relations.shape[1], self._max_pairs), 1), 1, 1)
+        ctx_for_rel = hlarge1 if hlarge1 is not None else h
         
         rel_clf = torch.zeros([batch_size, relations.shape[1], self._relation_types]).to(
             self.rel_classifier.weight.device)
@@ -408,8 +408,8 @@ class SynSpERT(SpERT):
         for i in range(0, relations.shape[1], self._max_pairs):
             # classify relation candidates
             chunk_rel_logits = self._classify_relations(entity_spans_pool, size_embeddings,
-                                                        relations, rel_masks, h_large, i, 
-                                                        entity_clf, hlarge2)
+                                                        relations, rel_masks, ctx_for_rel, i, 
+                                                        entity_clf)
             rel_clf[:, i:i + self._max_pairs, :] = chunk_rel_logits
         ############ [dks]
         return entity_clf, rel_clf
@@ -451,10 +451,7 @@ class SynSpERT(SpERT):
 
         rel_sample_masks_bool = rel_sample_masks
         rel_sample_masks = rel_sample_masks_bool.float().unsqueeze(-1)
-        h_large = h.unsqueeze(1).repeat(1, max(min(relations.shape[1], self._max_pairs), 1), 1, 1)
-        hlarge2 = None
-        if (self._use_pos):
-           hlarge2 = hlarge1.unsqueeze(1).repeat(1, max(min(relations.shape[1], self._max_pairs), 1), 1, 1)
+        ctx_for_rel = hlarge1 if hlarge1 is not None else h
 
         rel_clf = torch.zeros([batch_size, relations.shape[1], self._relation_types]).to(
             self.rel_classifier.weight.device)
@@ -465,8 +462,8 @@ class SynSpERT(SpERT):
             # classify relation candidates
             chunk_rel_logits = self._classify_relations(entity_spans_pool, size_embeddings,
                                                         relations, rel_masks, 
-                                                        h_large, i, 
-                                                        entity_clf, hlarge2)
+                                                        ctx_for_rel, i, 
+                                                        entity_clf)
             # apply sigmoid
             chunk_rel_clf = torch.sigmoid(chunk_rel_logits)
             rel_clf[:, i:i + self._max_pairs, :] = chunk_rel_clf

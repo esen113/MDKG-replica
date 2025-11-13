@@ -132,6 +132,7 @@ class SpERTTrainer(BaseTrainer):
         preference_loader = None
         preference_dataset = None
         preference_path = getattr(args, "dpo_preferences", None)
+        dpo_batch_size = getattr(self.args, "dpo_train_batch_size", None) or self.args.train_batch_size
         if self._ft_mode == "dpo" and preference_path:
             try:
                 preference_dataset = PreferenceDataset(
@@ -148,10 +149,10 @@ class SpERTTrainer(BaseTrainer):
                 if len(preference_dataset) == 0:
                     self._logger.warning("DPO preference dataset is empty; falling back to standard supervised loss.")
                 else:
-                    drop_last = len(preference_dataset) >= self.args.train_batch_size
+                    drop_last = len(preference_dataset) >= dpo_batch_size
                     preference_loader = DataLoader(
                         preference_dataset,
-                        batch_size=self.args.train_batch_size,
+                        batch_size=dpo_batch_size,
                         shuffle=True,
                         drop_last=drop_last,
                         num_workers=self.args.sampling_processes,
@@ -159,9 +160,9 @@ class SpERTTrainer(BaseTrainer):
                     )
                     train_sample_count = len(preference_dataset)
                     if drop_last:
-                        updates_epoch = max(train_sample_count // args.train_batch_size, 1)
+                        updates_epoch = max(train_sample_count // dpo_batch_size, 1)
                     else:
-                        updates_epoch = max(math.ceil(train_sample_count / args.train_batch_size), 1)
+                        updates_epoch = max(math.ceil(train_sample_count / dpo_batch_size), 1)
         if preference_loader is None:
             train_sample_count = train_dataset.document_count
             updates_epoch = max(train_sample_count // args.train_batch_size, 1)

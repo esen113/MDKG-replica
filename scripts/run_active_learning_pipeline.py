@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--dpo-epochs", type=int, default=4, help="Epochs for DPO fine-tuning.")
     train.add_argument("--train-batch-size", type=int, default=4, help="Train batch size for both runs.")
     train.add_argument("--eval-batch-size", type=int, default=4, help="Eval batch size for both runs.")
+    train.add_argument(
+        "--dpo-train-batch-size",
+        type=int,
+        default=None,
+        help="Override batch size used during DPO fine-tuning (defaults to --train-batch-size).",
+    )
     train.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate for baseline training.")
     train.add_argument("--sft-ft-epochs", type=int, default=3, help="Epochs for SFT fine-tuning after sample promotion.")
     train.add_argument(
@@ -357,6 +363,7 @@ def run_training(
     dpo_negatives: int = 4,
     dpo_reference: str | None = None,
     dpo_preferences: str | None = None,
+    dpo_train_batch: int | None = None,
 ) -> tuple[Path, Path]:
     print(f"[TRAIN] Starting training run '{label_suffix}'.")
     cmd = [
@@ -398,6 +405,8 @@ def run_training(
                 str(dpo_negatives),
             ]
         )
+        if dpo_train_batch is not None:
+            cmd.extend(["--dpo_train_batch_size", str(dpo_train_batch)])
         cmd.extend(
             [
                 "--neg_entity_count",
@@ -707,6 +716,7 @@ def main() -> None:
             dpo_negatives=args.dpo_negatives,
             dpo_reference=dpo_reference_model,
             dpo_preferences=str(preference_archive),
+            dpo_train_batch=args.dpo_train_batch_size,
         )
         current_model = final_model_path(initial_dpo_save_dir)
         initial_dpo_eval_dir = run_evaluation(
@@ -909,11 +919,12 @@ def main() -> None:
                 eval_batch=args.eval_batch_size,
                 ft_mode="dpo",
                 dpo_beta=args.dpo_beta,
-                dpo_lambda=args.dpo_lambda,
-                dpo_negatives=args.dpo_negatives,
-                dpo_reference=dpo_reference_model,
-                dpo_preferences=str(preference_archive),
-            )
+            dpo_lambda=args.dpo_lambda,
+            dpo_negatives=args.dpo_negatives,
+            dpo_reference=dpo_reference_model,
+            dpo_preferences=str(preference_archive),
+            dpo_train_batch=args.dpo_train_batch_size,
+        )
             current_model = final_model_path(dpo_save_dir)
             dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
             dpo_eval_dir = run_evaluation(
