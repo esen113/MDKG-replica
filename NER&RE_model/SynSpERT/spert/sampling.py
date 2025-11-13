@@ -324,9 +324,14 @@ def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
     Attach entity/relation labels to a pre-computed blueprint.
     """
     entity_spans = bp["entity_spans"]
+    if not torch.is_tensor(entity_spans):
+        entity_spans = torch.as_tensor(entity_spans, dtype=torch.long)
+    rel_indices = bp["rels"]
+    if not torch.is_tensor(rel_indices):
+        rel_indices = torch.as_tensor(rel_indices, dtype=torch.long)
     num_spans = entity_spans.shape[0]
     entity_types = torch.zeros(num_spans, dtype=torch.long)
-    span_lookup = {tuple(span.tolist()): idx for idx, span in enumerate(entity_spans.tolist())}
+    span_lookup = {tuple(span): idx for idx, span in enumerate(entity_spans.tolist())}
 
     if hasattr(doc, "entities"):
         for entity in getattr(doc, "entities", []):
@@ -341,7 +346,6 @@ def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
                 entity_types[idx] = ent_type
 
     rel_type_dim = max(relation_type_count - 1, 0)
-    rel_indices = bp["rels"]
     rel_types = torch.zeros(rel_indices.shape[0], rel_type_dim, dtype=torch.float32)
     if rel_type_dim == 0 or int(bp["entity_sample_masks"].sum()) == 0 or rel_indices.shape[0] == 0:
         return entity_types, rel_types

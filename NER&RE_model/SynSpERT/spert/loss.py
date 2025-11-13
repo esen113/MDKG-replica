@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class Loss(ABC):
     def compute(self, *args, **kwargs):
-    pass
+        pass
 
 
 class SpERTLoss(Loss):
