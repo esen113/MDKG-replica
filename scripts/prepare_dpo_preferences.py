@@ -252,37 +252,48 @@ def _entity_candidates_and_preferences(
     pred_entities: Sequence[EntityTriplet],
     none_label: str,
 ) -> Tuple[List[Dict[str, Any]], PreferencePairs]:
-    gold_set = set(gold_entities)
-    pred_set = set(pred_entities)
-    candidates = set(gold_set | pred_set)
-    prefs: PreferencePairs = []
-
     gold_by_span: Dict[Tuple[int, int], set[str]] = defaultdict(set)
     pred_by_span: Dict[Tuple[int, int], set[str]] = defaultdict(set)
-    for start, end, label in gold_set:
+    for start, end, label in gold_entities:
         gold_by_span[(start, end)].add(label)
-    for start, end, label in pred_set:
+    for start, end, label in pred_entities:
         pred_by_span[(start, end)].add(label)
+
+    candidates: set[EntityTriplet] = set()
+    prefs: PreferencePairs = []
+
+    def _add_candidate(span: Tuple[int, int], label: str) -> EntityTriplet:
+        candidate = (span[0], span[1], label)
+        candidates.add(candidate)
+        return candidate
 
     for span in sorted(gold_by_span.keys()):
         gold_types = sorted(gold_by_span[span])
         pred_types = sorted(pred_by_span.get(span, set()))
-        if not pred_types:
-            none_candidate = (span[0], span[1], none_label)
-            candidates.add(none_candidate)
-            for label in gold_types:
-                prefs.append(((span[0], span[1], label), none_candidate))
-        else:
+
+        for label in gold_types:
+            _add_candidate(span, label)
+        for label in pred_types:
+            _add_candidate(span, label)
+
+        if pred_types:
             for label in gold_types:
                 for pred_label in pred_types:
                     if label != pred_label:
                         prefs.append(((span[0], span[1], label), (span[0], span[1], pred_label)))
+        else:
+            none_candidate = _add_candidate(span, none_label)
+            for label in gold_types:
+                prefs.append(((span[0], span[1], label), none_candidate))
 
-    for hallucination in sorted(pred_set - gold_set, key=_entity_sort_key):
-        span = (hallucination[0], hallucination[1])
-        none_candidate = (span[0], span[1], none_label)
-        candidates.add(none_candidate)
-        prefs.append((none_candidate, hallucination))
+        pred_by_span.pop(span, None)
+
+    for span in sorted(pred_by_span.keys()):
+        pred_types = sorted(pred_by_span[span])
+        none_candidate = _add_candidate(span, none_label)
+        for label in pred_types:
+            hallucination = _add_candidate(span, label)
+            prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_entity_sort_key)
     candidate_map = {cand: idx for idx, cand in enumerate(ordered_candidates)}
@@ -302,36 +313,48 @@ def _relation_candidates_and_preferences(
     pred_relations: Sequence[RelationTriplet],
     none_label: str,
 ) -> Tuple[List[Dict[str, Any]], PreferencePairs]:
-    gold_set = set(gold_relations)
-    pred_set = set(pred_relations)
-    candidates = set(gold_set | pred_set)
-    prefs: PreferencePairs = []
-
     gold_by_pair: Dict[Tuple[Span, Span], set[str]] = defaultdict(set)
     pred_by_pair: Dict[Tuple[Span, Span], set[str]] = defaultdict(set)
-    for head, tail, label in gold_set:
+    for head, tail, label in gold_relations:
         gold_by_pair[(head, tail)].add(label)
-    for head, tail, label in pred_set:
+    for head, tail, label in pred_relations:
         pred_by_pair[(head, tail)].add(label)
+
+    candidates: set[RelationTriplet] = set()
+    prefs: PreferencePairs = []
+
+    def _add_candidate(pair: Tuple[Span, Span], label: str) -> RelationTriplet:
+        candidate = (pair[0], pair[1], label)
+        candidates.add(candidate)
+        return candidate
 
     for pair in sorted(gold_by_pair.keys(), key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1])):
         gold_types = sorted(gold_by_pair[pair])
         pred_types = sorted(pred_by_pair.get(pair, set()))
-        if not pred_types:
-            none_candidate = (pair[0], pair[1], none_label)
-            candidates.add(none_candidate)
+
+        for label in gold_types:
+            _add_candidate(pair, label)
+        for label in pred_types:
+            _add_candidate(pair, label)
+
+        if pred_types:
+            for label in gold_types:
+                for pred_label in pred_types:
+                    if label != pred_label:
+                        prefs.append(((pair[0], pair[1], label), (pair[0], pair[1], pred_label)))
+        else:
+            none_candidate = _add_candidate(pair, none_label)
             for label in gold_types:
                 prefs.append(((pair[0], pair[1], label), none_candidate))
-            continue
-        for label in gold_types:
-            for pred_label in pred_types:
-                if label != pred_label:
-                    prefs.append(((pair[0], pair[1], label), (pair[0], pair[1], pred_label)))
 
-    for hallucination in sorted(pred_set - gold_set, key=_relation_sort_key):
-        none_candidate = (hallucination[0], hallucination[1], none_label)
-        candidates.add(none_candidate)
-        prefs.append((none_candidate, hallucination))
+        pred_by_pair.pop(pair, None)
+
+    for pair in sorted(pred_by_pair.keys(), key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1])):
+        pred_types = sorted(pred_by_pair[pair])
+        none_candidate = _add_candidate(pair, none_label)
+        for label in pred_types:
+            hallucination = _add_candidate(pair, label)
+            prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_relation_sort_key)
     candidate_map = {cand: idx for idx, cand in enumerate(ordered_candidates)}
