@@ -319,6 +319,138 @@ def build_candidate_blueprint(doc, input_reader, max_span_size: int, relation_ty
     )
 
 
+def _extract_entity_spans(doc):
+    if hasattr(doc, "entities"):
+        for entity in getattr(doc, "entities", []):
+            yield (entity.span_start, entity.span_end)
+    else:
+        for entity in doc.get("entities", []):
+            start = entity.get("start", entity.get("span_start"))
+            end = entity.get("end", entity.get("span_end"))
+            if start is None or end is None:
+                continue
+            yield (start, end)
+
+
+def _extract_relation_spans(doc):
+    if hasattr(doc, "relations"):
+        for rel in getattr(doc, "relations", []):
+            head_span = (rel.head_entity.span_start, rel.head_entity.span_end)
+            tail_span = (rel.tail_entity.span_start, rel.tail_entity.span_end)
+            yield head_span, tail_span
+    else:
+        for rel in doc.get("relations", []):
+            head_span = (rel.get("head_start"), rel.get("head_end"))
+            tail_span = (rel.get("tail_start"), rel.get("tail_end"))
+            if head_span[0] is None or head_span[1] is None:
+                continue
+            if tail_span[0] is None or tail_span[1] is None:
+                continue
+            yield head_span, tail_span
+
+
+def build_preference_blueprint(
+    chosen_doc,
+    rejected_doc,
+    max_span_size: int,
+    relation_type_count: int,
+    max_entities: int = 0,
+    max_relations: int = 0,
+):
+    """
+    Construct a compact candidate blueprint for DPO by reusing spans (and relation pairs)
+    that appear in either the chosen or rejected annotations.
+    """
+    # max_span_size and relation_type_count are accepted for API parity with build_candidate_blueprint.
+    _ = (max_span_size, relation_type_count)
+
+    encodings = torch.tensor(chosen_doc.encoding, dtype=torch.long)
+    context_size = len(chosen_doc.encoding)
+    context_masks = torch.ones(context_size, dtype=torch.bool)
+
+    dephead, deplabel, pos = add_syntax_info(chosen_doc, context_size)
+
+    chosen_spans = list(_extract_entity_spans(chosen_doc))
+    rejected_spans = list(_extract_entity_spans(rejected_doc))
+
+    span_set = {span: span for span in chosen_spans}
+    for span in rejected_spans:
+        span_set.setdefault(span, span)
+
+    spans = sorted(span_set.values(), key=lambda s: (s[0], s[1]))
+    gt_spans = set(chosen_spans)
+    if max_entities > 0 and len(spans) > max_entities:
+        kept = [span for span in spans if span in gt_spans]
+        if len(kept) >= max_entities:
+            spans = kept[:max_entities]
+        else:
+            extras_needed = max_entities - len(kept)
+            extras = [span for span in spans if span not in gt_spans][:extras_needed]
+            spans = kept + extras
+
+    if spans:
+        entity_masks = [create_entity_mask(span[0], span[1], context_size) for span in spans]
+        entity_sizes = [span[1] - span[0] for span in spans]
+        entity_masks_tensor = torch.stack(entity_masks)
+        entity_sizes_tensor = torch.tensor(entity_sizes, dtype=torch.long)
+        entity_spans_tensor = torch.tensor(spans, dtype=torch.long)
+        entity_sample_masks = torch.ones(len(spans), dtype=torch.bool)
+    else:
+        entity_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        entity_sizes_tensor = torch.zeros([1], dtype=torch.long)
+        entity_spans_tensor = torch.zeros([1, 2], dtype=torch.long)
+        entity_sample_masks = torch.zeros([1], dtype=torch.bool)
+        spans = [(0, 0)]
+
+    span2idx = {span: idx for idx, span in enumerate(spans)}
+    rel_pairs = []
+    rel_pair_set = set()
+
+    def _add_relations(doc):
+        for head_span, tail_span in _extract_relation_spans(doc):
+            if head_span == tail_span:
+                continue
+            if head_span not in span2idx or tail_span not in span2idx:
+                continue
+            pair = (span2idx[head_span], span2idx[tail_span])
+            if pair in rel_pair_set:
+                continue
+            rel_pair_set.add(pair)
+            rel_pairs.append(pair)
+
+    _add_relations(chosen_doc)
+    _add_relations(rejected_doc)
+    if max_relations > 0 and len(rel_pairs) > max_relations:
+        rel_pairs = rel_pairs[:max_relations]
+
+    if rel_pairs:
+        rels_tensor = torch.tensor(rel_pairs, dtype=torch.long)
+        rel_masks = [
+            create_rel_mask(spans[h_idx], spans[t_idx], context_size) for h_idx, t_idx in rel_pairs
+        ]
+        rel_masks_tensor = torch.stack(rel_masks)
+        rel_sample_masks = torch.ones(len(rel_pairs), dtype=torch.bool)
+    else:
+        rels_tensor = torch.zeros([1, 2], dtype=torch.long)
+        rel_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        rel_sample_masks = torch.zeros([1], dtype=torch.bool)
+
+    return dict(
+        encodings=encodings,
+        context_masks=context_masks,
+        entity_masks=entity_masks_tensor,
+        entity_sizes=entity_sizes_tensor,
+        entity_spans=entity_spans_tensor,
+        rels=rels_tensor,
+        rel_masks=rel_masks_tensor,
+        entity_sample_masks=entity_sample_masks,
+        rel_sample_masks=rel_sample_masks,
+        dephead=dephead,
+        deplabel=deplabel,
+        pos=pos,
+    )
+
+
 def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
     """
     Attach entity/relation labels to a pre-computed blueprint.
@@ -350,13 +482,10 @@ def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
     if rel_type_dim == 0 or int(bp["entity_sample_masks"].sum()) == 0 or rel_indices.shape[0] == 0:
         return entity_types, rel_types
 
-    span_count = num_spans
-
-    def _pair_index(head_idx: int, tail_idx: int):
-        if head_idx == tail_idx or span_count <= 1:
-            return None
-        offset = tail_idx if tail_idx < head_idx else tail_idx - 1
-        return head_idx * (span_count - 1) + offset
+    pair_lookup = {}
+    rel_list = rel_indices.tolist() if rel_indices.numel() else []
+    for idx, (head_idx, tail_idx) in enumerate(rel_list):
+        pair_lookup[(head_idx, tail_idx)] = idx
 
     if hasattr(doc, "relations"):
         for rel in getattr(doc, "relations", []):
@@ -364,7 +493,7 @@ def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
             tail_idx = span_lookup.get((rel.tail_entity.span_start, rel.tail_entity.span_end))
             if head_idx is None or tail_idx is None:
                 continue
-            pair_idx = _pair_index(head_idx, tail_idx)
+            pair_idx = pair_lookup.get((head_idx, tail_idx))
             if pair_idx is None or pair_idx >= rel_types.shape[0]:
                 continue
             rel_type_idx = rel.relation_type.index - 1
@@ -376,7 +505,7 @@ def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
             tail_idx = span_lookup.get((rel["tail_start"], rel["tail_end"]))
             if head_idx is None or tail_idx is None:
                 continue
-            pair_idx = _pair_index(head_idx, tail_idx)
+            pair_idx = pair_lookup.get((head_idx, tail_idx))
             if pair_idx is None or pair_idx >= rel_types.shape[0]:
                 continue
             rel_meta = input_reader.relation_types[rel["type"]]

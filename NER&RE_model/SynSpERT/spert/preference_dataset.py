@@ -45,9 +45,16 @@ class PreferenceDataset(TorchDataset):
         self._positive_docs = self._positive_dataset.documents
         self._negative_docs = self._negative_dataset.documents
         self._blueprints = []
-        for doc in self._positive_docs:
-            bp = sampling.build_candidate_blueprint(
-                doc, input_reader, max_span_size, self._relation_type_count
+        dpo_max_entities = getattr(input_reader, "dpo_max_entities", 0)
+        dpo_max_relations = getattr(input_reader, "dpo_max_relations", 0)
+        for chosen_doc, rejected_doc in zip(self._positive_docs, self._negative_docs):
+            bp = sampling.build_preference_blueprint(
+                chosen_doc,
+                rejected_doc,
+                max_span_size=self._max_span_size,
+                relation_type_count=self._relation_type_count,
+                max_entities=dpo_max_entities,
+                max_relations=dpo_max_relations,
             )
             self._blueprints.append(bp)
 
