@@ -53,6 +53,9 @@ DPO_LAMBDA = 0.1
 DPO_NEGATIVES = 4
 DPO_REFERENCE: str | None = None
 DPO_PREFERENCES: str | None = None
+DPO_FORMAT = "doc"
+DPO_LAMBDA_ENTITY = 1.0
+DPO_LAMBDA_RELATION = 1.0
 
 
 def ensure_directories(extra_dir: Path | None = None):
@@ -189,6 +192,9 @@ def build_train_args() -> list:
         args_list.extend(["--dpo_beta", str(DPO_BETA)])
         args_list.extend(["--dpo_lambda", str(DPO_LAMBDA)])
         args_list.extend(["--dpo_negatives", str(DPO_NEGATIVES)])
+        args_list.extend(["--dpo_format", DPO_FORMAT])
+        args_list.extend(["--dpo_lambda_entity", str(DPO_LAMBDA_ENTITY)])
+        args_list.extend(["--dpo_lambda_relation", str(DPO_LAMBDA_RELATION)])
         if DPO_TRAIN_BATCH_SIZE is not None:
             args_list.extend(["--dpo_train_batch_size", str(DPO_TRAIN_BATCH_SIZE)])
         if DPO_REFERENCE:
@@ -376,6 +382,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpo_negatives", type=int, default=DPO_NEGATIVES)
     parser.add_argument("--dpo_reference", type=str, default=DPO_REFERENCE)
     parser.add_argument("--dpo_preferences", type=str, default=None)
+    parser.add_argument("--dpo_format", choices=["doc", "triple"], default=DPO_FORMAT)
+    parser.add_argument("--dpo_lambda_entity", type=float, default=DPO_LAMBDA_ENTITY)
+    parser.add_argument("--dpo_lambda_relation", type=float, default=DPO_LAMBDA_RELATION)
     return parser.parse_args()
 
 
@@ -385,6 +394,7 @@ def main():
     global TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, LEARNING_RATE, LR_WARMUP, WEIGHT_DECAY
     global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
     global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE, DPO_PREFERENCES, DPO_TRAIN_BATCH_SIZE
+    global DPO_FORMAT, DPO_LAMBDA_ENTITY, DPO_LAMBDA_RELATION
     global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
 
     LOG_PATH = Path(args.log_path).expanduser().resolve()
@@ -421,6 +431,9 @@ def main():
     DPO_NEGATIVES = args.dpo_negatives
     DPO_REFERENCE = args.dpo_reference
     DPO_PREFERENCES = args.dpo_preferences
+    DPO_FORMAT = args.dpo_format
+    DPO_LAMBDA_ENTITY = args.dpo_lambda_entity
+    DPO_LAMBDA_RELATION = args.dpo_lambda_relation
 
     if args.mode == "train":
         run_args = build_train_args()

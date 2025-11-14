@@ -40,7 +40,6 @@ Example (`python scripts/run_active_learning_pipeline.py`):
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import random
 import re
@@ -52,6 +51,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
+
+from prepare_dpo_preferences import DEFAULT_PROMPT_TEMPLATE, prepare_preference_records
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +144,34 @@ def parse_args() -> argparse.Namespace:
         choices=("base", "latest"),
         default="base",
         help="Checkpoint used to initialize/reference each DPO run ('base' uses the round0 SFT model).",
+    )
+    train.add_argument(
+        "--dpo-preference-format",
+        choices=("doc", "triple"),
+        default="triple",
+        help="Schema used for generated DPO preferences ('triple' enables candidate-level supervision).",
+    )
+    train.add_argument(
+        "--dpo-max-entity-prefs",
+        type=int,
+        default=50,
+        help="Maximum entity preference pairs per example when building triple-format preferences.",
+    )
+    train.add_argument(
+        "--dpo-max-relation-prefs",
+        type=int,
+        default=50,
+        help="Maximum relation preference pairs per example when building triple-format preferences.",
+    )
+    train.add_argument(
+        "--dpo-entity-none-label",
+        default="None",
+        help="Placeholder label written for missing entities in triple-format preferences.",
+    )
+    train.add_argument(
+        "--dpo-relation-none-label",
+        default="None",
+        help="Placeholder label written for missing relations in triple-format preferences.",
     )
 
     al = parser.add_argument_group("Active learning")
@@ -364,6 +393,7 @@ def run_training(
     dpo_reference: str | None = None,
     dpo_preferences: str | None = None,
     dpo_train_batch: int | None = None,
+    dpo_format: str = "doc",
 ) -> tuple[Path, Path]:
     print(f"[TRAIN] Starting training run '{label_suffix}'.")
     cmd = [
@@ -403,6 +433,8 @@ def run_training(
                 str(dpo_lambda),
                 "--dpo_negatives",
                 str(dpo_negatives),
+                "--dpo_format",
+                dpo_format,
             ]
         )
         if dpo_train_batch is not None:
@@ -547,43 +579,35 @@ def parse_eval_metrics(log_dir: Path) -> dict:
     return metrics
 
 
-def build_dpo_preferences(human_docs: list, model_docs: list, output_jsonl: Path) -> int:
+def build_dpo_preferences(
+    human_docs: list,
+    model_docs: list,
+    output_jsonl: Path,
+    *,
+    preference_format: str,
+    max_entity_prefs: int,
+    max_relation_prefs: int,
+    entity_none_label: str,
+    relation_none_label: str,
+) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    kept = 0
-    skipped = 0
+    records, skipped = prepare_preference_records(
+        human_docs,
+        model_docs,
+        DEFAULT_PROMPT_TEMPLATE,
+        preference_format,
+        max_entity_prefs,
+        max_relation_prefs,
+        entity_none_label,
+        relation_none_label,
+    )
+
     with output_jsonl.open("w", encoding="utf-8") as fout:
-        for doc, pred in zip(human_docs, model_docs):
-            tokens = doc.get("tokens", [])
-            prompt = "Extract entities and relations from the sentence:\n" + " ".join(tokens)
-
-            chosen_entities = sorted(
-                doc.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
-            )
-            chosen_relations = sorted(
-                doc.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
-            )
-            rejected_entities = sorted(
-                pred.get("entities", []), key=lambda e: (e["start"], e["end"], e.get("type", ""))
-            )
-            rejected_relations = sorted(
-                pred.get("relations", []), key=lambda r: (r["head"], r["tail"], r.get("type", ""))
-            )
-
-            if chosen_entities == rejected_entities and chosen_relations == rejected_relations:
-                skipped += 1
-                continue
-
-            record = {
-                "prompt": prompt,
-                "doc": copy.deepcopy(doc),
-                "rejected_entities": rejected_entities,
-                "rejected_relations": rejected_relations,
-                "orig_id": doc.get("orig_id"),
-            }
+        for record in records:
             fout.write(json.dumps(record, ensure_ascii=False))
             fout.write("\n")
-            kept += 1
 
+    kept = len(records)
     if kept == 0:
         print(
             "[WARN] All selected samples perfectly matched the latest SFT predictions; "
@@ -685,7 +709,16 @@ def main() -> None:
         )
         seed_pred_path = seed_eval_dir / "predictions_test_epoch_0.json"
         seed_predictions = load_json(seed_pred_path)
-        seed_pref_count = build_dpo_preferences(dpo_seed_docs, seed_predictions, seed_pref_path)
+        seed_pref_count = build_dpo_preferences(
+            dpo_seed_docs,
+            seed_predictions,
+            seed_pref_path,
+            preference_format=args.dpo_preference_format,
+            max_entity_prefs=args.dpo_max_entity_prefs,
+            max_relation_prefs=args.dpo_max_relation_prefs,
+            entity_none_label=args.dpo_entity_none_label,
+            relation_none_label=args.dpo_relation_none_label,
+        )
     else:
         seed_pref_path.touch()
 
@@ -717,6 +750,7 @@ def main() -> None:
             dpo_reference=dpo_reference_model,
             dpo_preferences=str(preference_archive),
             dpo_train_batch=args.dpo_train_batch_size,
+            dpo_format=args.dpo_preference_format,
         )
         current_model = final_model_path(initial_dpo_save_dir)
         initial_dpo_eval_dir = run_evaluation(
@@ -895,7 +929,16 @@ def main() -> None:
         dump_json(sft_pred_path, baseline_selected_predictions)
 
         preference_jsonl = round_dir / f"dpo_preferences_round{round_idx}.jsonl"
-        preference_count = build_dpo_preferences(selected_docs, baseline_selected_predictions, preference_jsonl)
+        preference_count = build_dpo_preferences(
+            selected_docs,
+            baseline_selected_predictions,
+            preference_jsonl,
+            preference_format=args.dpo_preference_format,
+            max_entity_prefs=args.dpo_max_entity_prefs,
+            max_relation_prefs=args.dpo_max_relation_prefs,
+            entity_none_label=args.dpo_entity_none_label,
+            relation_none_label=args.dpo_relation_none_label,
+        )
         if preference_count > 0:
             append_jsonl(preference_jsonl, preference_archive)
             total_preference_count += preference_count
@@ -919,12 +962,13 @@ def main() -> None:
                 eval_batch=args.eval_batch_size,
                 ft_mode="dpo",
                 dpo_beta=args.dpo_beta,
-            dpo_lambda=args.dpo_lambda,
-            dpo_negatives=args.dpo_negatives,
-            dpo_reference=dpo_reference_model,
-            dpo_preferences=str(preference_archive),
-            dpo_train_batch=args.dpo_train_batch_size,
-        )
+                dpo_lambda=args.dpo_lambda,
+                dpo_negatives=args.dpo_negatives,
+                dpo_reference=dpo_reference_model,
+                dpo_preferences=str(preference_archive),
+                dpo_train_batch=args.dpo_train_batch_size,
+                dpo_format=args.dpo_preference_format,
+            )
             current_model = final_model_path(dpo_save_dir)
             dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
             dpo_eval_dir = run_evaluation(

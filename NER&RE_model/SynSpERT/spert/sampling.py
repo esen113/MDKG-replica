@@ -451,6 +451,100 @@ def build_preference_blueprint(
     )
 
 
+def build_candidate_blueprint_from_candidates(
+    doc,
+    entity_candidates,
+    relation_candidates,
+    max_span_size: int,
+    relation_type_count: int,
+    max_entities: int = 0,
+    max_relations: int = 0,
+):
+    """
+    Construct a blueprint directly from explicit candidate pools.
+    """
+    _ = (max_span_size, relation_type_count, max_entities, max_relations)
+
+    encodings = torch.tensor(doc.encoding, dtype=torch.long)
+    context_size = len(doc.encoding)
+    context_masks = torch.ones(context_size, dtype=torch.bool)
+    dephead, deplabel, pos = add_syntax_info(doc, context_size)
+
+    spans = []
+    seen_spans = set()
+    for cand in entity_candidates:
+        span = cand.get("span")
+        if not span or len(span) != 2:
+            continue
+        start, end = int(span[0]), int(span[1])
+        tup = (start, end)
+        if tup in seen_spans:
+            continue
+        seen_spans.add(tup)
+        spans.append(tup)
+
+    if spans:
+        entity_masks = [create_entity_mask(start, end, context_size) for start, end in spans]
+        entity_sizes = [end - start for start, end in spans]
+        entity_masks_tensor = torch.stack(entity_masks)
+        entity_sizes_tensor = torch.tensor(entity_sizes, dtype=torch.long)
+        entity_spans_tensor = torch.tensor(spans, dtype=torch.long)
+        entity_sample_masks = torch.ones(len(spans), dtype=torch.bool)
+    else:
+        entity_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        entity_sizes_tensor = torch.zeros([1], dtype=torch.long)
+        entity_spans_tensor = torch.zeros([1, 2], dtype=torch.long)
+        entity_sample_masks = torch.zeros([1], dtype=torch.bool)
+        spans = [(0, 0)]
+
+    span2idx = {span: idx for idx, span in enumerate(spans)}
+    rel_pairs = []
+    rel_masks = []
+    rel_sample_masks = []
+    seen_pairs = set()
+
+    for cand in relation_candidates:
+        h_span_raw = cand.get("h")
+        t_span_raw = cand.get("t")
+        if not h_span_raw or not t_span_raw:
+            continue
+        head_span = (int(h_span_raw[0]), int(h_span_raw[1]))
+        tail_span = (int(t_span_raw[0]), int(t_span_raw[1]))
+        if head_span not in span2idx or tail_span not in span2idx:
+            continue
+        pair = (span2idx[head_span], span2idx[tail_span])
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        rel_pairs.append(pair)
+        rel_masks.append(create_rel_mask(head_span, tail_span, context_size))
+        rel_sample_masks.append(1)
+
+    if rel_pairs:
+        rels_tensor = torch.tensor(rel_pairs, dtype=torch.long)
+        rel_masks_tensor = torch.stack(rel_masks)
+        rel_sample_masks_tensor = torch.tensor(rel_sample_masks, dtype=torch.bool)
+    else:
+        rels_tensor = torch.zeros([1, 2], dtype=torch.long)
+        rel_masks_tensor = torch.zeros([1, context_size], dtype=torch.bool)
+        rel_sample_masks_tensor = torch.zeros([1], dtype=torch.bool)
+
+    return dict(
+        encodings=encodings,
+        context_masks=context_masks,
+        entity_masks=entity_masks_tensor,
+        entity_sizes=entity_sizes_tensor,
+        entity_spans=entity_spans_tensor,
+        rels=rels_tensor,
+        rel_masks=rel_masks_tensor,
+        entity_sample_masks=entity_sample_masks,
+        rel_sample_masks=rel_sample_masks_tensor,
+        dephead=dephead,
+        deplabel=deplabel,
+        pos=pos,
+    )
+
+
 def attach_labels_to_blueprint(bp, doc, input_reader, relation_type_count: int):
     """
     Attach entity/relation labels to a pre-computed blueprint.

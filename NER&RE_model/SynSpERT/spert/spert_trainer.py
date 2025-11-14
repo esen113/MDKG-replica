@@ -111,6 +111,9 @@ class SpERTTrainer(BaseTrainer):
         self._logger.info("Model type: %s" % args.model_type)
 
         self._ft_mode = getattr(args, "ft_mode", "sft")
+        self._dpo_format = getattr(args, "dpo_format", "doc")
+        self._dpo_lambda_entity = float(getattr(args, "dpo_lambda_entity", 1.0))
+        self._dpo_lambda_relation = float(getattr(args, "dpo_lambda_relation", 1.0))
         if self._ft_mode == "dpo":
             # Freeze candidate sampling knobs for DPO runs
             args.neg_entity_count = 0
@@ -142,6 +145,7 @@ class SpERTTrainer(BaseTrainer):
                     neg_entity_count=args.neg_entity_count,
                     neg_relation_count=args.neg_relation_count,
                     max_span_size=args.max_span_size,
+                    dpo_format=self._dpo_format,
                 )
             except Exception as exc:
                 self._logger.warning(f"Failed to load DPO preferences '{preference_path}': {exc}")
@@ -386,6 +390,70 @@ class SpERTTrainer(BaseTrainer):
         iteration = 0
         total = len(data_loader)
 
+        if getattr(self, "_dpo_format", "doc") != "doc":
+            for batch in tqdm(data_loader, total=total, desc=f"DPO epoch {epoch}"):
+                model.train()
+                blueprint = util.to_device(batch["blueprint"], self._device)
+                entity_type_ids = batch["entity_type_ids"].to(self._device)
+                relation_type_ids = batch["relation_type_ids"].to(self._device)
+                relation_pair_indices = batch["relation_pair_indices"].to(self._device)
+                entity_pref_pairs = batch["entity_pref_pairs"].to(self._device)
+                relation_pref_pairs = batch["relation_pref_pairs"].to(self._device)
+
+                if entity_pref_pairs.shape[0] == 0 and relation_pref_pairs.shape[0] == 0:
+                    continue
+
+                entity_logits, rel_logits = model(
+                    encodings=blueprint["encodings"],
+                    context_masks=blueprint["context_masks"],
+                    entity_masks=blueprint["entity_masks"],
+                    entity_sizes=blueprint["entity_sizes"],
+                    relations=blueprint["rels"],
+                    rel_masks=blueprint["rel_masks"],
+                    dephead=blueprint["dephead"],
+                    deplabel=blueprint["deplabel"],
+                    pos=blueprint["pos"],
+                )
+
+                ref_entity_logits = ref_rel_logits = None
+                if self._ref_model is not None:
+                    with torch.no_grad():
+                        ref_entity_logits, ref_rel_logits = self._ref_model(
+                            encodings=blueprint["encodings"],
+                            context_masks=blueprint["context_masks"],
+                            entity_masks=blueprint["entity_masks"],
+                            entity_sizes=blueprint["entity_sizes"],
+                            relations=blueprint["rels"],
+                            rel_masks=blueprint["rel_masks"],
+                            dephead=blueprint["dephead"],
+                            deplabel=blueprint["deplabel"],
+                            pos=blueprint["pos"],
+                        )
+
+                entity_loss = self._entity_preference_loss(
+                    entity_logits, entity_type_ids, entity_pref_pairs, ref_entity_logits
+                )
+                relation_loss = self._relation_preference_loss(
+                    rel_logits, relation_type_ids, relation_pair_indices, relation_pref_pairs, ref_rel_logits
+                )
+                total_loss = self.args.dpo_lambda * (
+                    self._dpo_lambda_entity * entity_loss + self._dpo_lambda_relation * relation_loss
+                )
+
+                if not total_loss.requires_grad:
+                    continue
+
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+
+                iteration += 1
+                global_iteration = epoch * total + iteration
+                self._log_train(optimizer, float(total_loss.detach()), epoch, iteration, global_iteration, label)
+            return
+
         for chosen_batch, rejected_batch in tqdm(data_loader, total=total, desc=f"DPO epoch {epoch}"):
             model.train()
             chosen_batch = util.to_device(chosen_batch, self._device)
@@ -471,6 +539,89 @@ class SpERTTrainer(BaseTrainer):
             iteration += 1
             global_iteration = epoch * total + iteration
             self._log_train(optimizer, float(dpo_loss.detach()), epoch, iteration, global_iteration, label)
+
+    def _entity_preference_loss(self, logits, type_ids, pref_pairs, ref_logits=None):
+        if pref_pairs.shape[0] == 0:
+            return torch.tensor(0.0, device=self._device)
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        if ref_logits is not None:
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+        else:
+            ref_log_probs = None
+
+        batch_idx = pref_pairs[:, 0]
+        pos_idx = pref_pairs[:, 1]
+        neg_idx = pref_pairs[:, 2]
+        pos_type_ids = type_ids[batch_idx, pos_idx]
+        neg_type_ids = type_ids[batch_idx, neg_idx]
+
+        logp_pos = log_probs[batch_idx, pos_idx, pos_type_ids]
+        logp_neg = log_probs[batch_idx, neg_idx, neg_type_ids]
+        if ref_log_probs is not None:
+            logp_pos_ref = ref_log_probs[batch_idx, pos_idx, pos_type_ids]
+            logp_neg_ref = ref_log_probs[batch_idx, neg_idx, neg_type_ids]
+        else:
+            logp_pos_ref = torch.zeros_like(logp_pos)
+            logp_neg_ref = torch.zeros_like(logp_neg)
+
+        diff_policy = logp_pos - logp_neg
+        diff_ref = logp_pos_ref - logp_neg_ref
+        return -torch.logsigmoid(self.args.dpo_beta * (diff_policy - diff_ref)).mean()
+
+    def _relation_preference_loss(
+        self, logits, type_ids, pair_indices, pref_pairs, ref_logits=None
+    ):
+        if pref_pairs.shape[0] == 0:
+            return torch.tensor(0.0, device=self._device)
+
+        log_sigmoid = F.logsigmoid(logits)
+        log_none = F.logsigmoid(-logits).sum(dim=-1)
+
+        if ref_logits is not None:
+            ref_log_sigmoid = F.logsigmoid(ref_logits)
+            ref_log_none = F.logsigmoid(-ref_logits).sum(dim=-1)
+        else:
+            ref_log_sigmoid = None
+            ref_log_none = None
+
+        batch_idx = pref_pairs[:, 0]
+        pos_idx = pref_pairs[:, 1]
+        neg_idx = pref_pairs[:, 2]
+
+        pos_pair_idx = pair_indices[batch_idx, pos_idx]
+        neg_pair_idx = pair_indices[batch_idx, neg_idx]
+        pos_type_ids = type_ids[batch_idx, pos_idx]
+        neg_type_ids = type_ids[batch_idx, neg_idx]
+
+        logp_pos = self._gather_relation_logp(log_sigmoid, log_none, batch_idx, pos_pair_idx, pos_type_ids)
+        logp_neg = self._gather_relation_logp(log_sigmoid, log_none, batch_idx, neg_pair_idx, neg_type_ids)
+
+        if ref_log_sigmoid is not None and ref_log_none is not None:
+            logp_pos_ref = self._gather_relation_logp(
+                ref_log_sigmoid, ref_log_none, batch_idx, pos_pair_idx, pos_type_ids
+            )
+            logp_neg_ref = self._gather_relation_logp(
+                ref_log_sigmoid, ref_log_none, batch_idx, neg_pair_idx, neg_type_ids
+            )
+        else:
+            logp_pos_ref = torch.zeros_like(logp_pos)
+            logp_neg_ref = torch.zeros_like(logp_neg)
+
+        diff_policy = logp_pos - logp_neg
+        diff_ref = logp_pos_ref - logp_neg_ref
+        return -torch.logsigmoid(self.args.dpo_beta * (diff_policy - diff_ref)).mean()
+
+    @staticmethod
+    def _gather_relation_logp(log_sigmoid, log_none, batch_idx, pair_idx, type_ids):
+        scores = torch.zeros_like(type_ids, dtype=log_sigmoid.dtype)
+        mask = type_ids > 0
+        if mask.any():
+            rel_ids = type_ids[mask] - 1
+            scores[mask] = log_sigmoid[batch_idx[mask], pair_idx[mask], rel_ids]
+        if (~mask).any():
+            scores[~mask] = log_none[batch_idx[~mask], pair_idx[~mask]]
+        return scores
 
     def _preference_log_prob(self, entity_logits, rel_logits, batch):
         entity_lp = self._entity_log_prob(entity_logits, batch)
