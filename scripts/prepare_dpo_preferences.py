@@ -215,10 +215,18 @@ def _extract_pred_entities(pred_doc: Dict[str, Any]) -> List[EntityTriplet]:
     return entities
 
 
-def _extract_pred_relations(pred_doc: Dict[str, Any]) -> List[RelationTriplet]:
+def _extract_pred_relations(
+    pred_doc: Dict[str, Any],
+    reference_entities: Sequence[EntityTriplet] | None = None,
+) -> List[RelationTriplet]:
     relations = []
     pred_entities = pred_doc.get("entities", [])
     spans = [(int(ent.get("start", 0)), int(ent.get("end", ent.get("start", 0)))) for ent in pred_entities]
+
+    reference_spans = None
+    if reference_entities:
+        reference_spans = {(start, end) for start, end, _ in reference_entities}
+
     for rel in pred_doc.get("relations", []):
         head_idx = int(rel.get("head", -1))
         tail_idx = int(rel.get("tail", -1))
@@ -228,6 +236,12 @@ def _extract_pred_relations(pred_doc: Dict[str, Any]) -> List[RelationTriplet]:
             continue
         head_span = spans[head_idx]
         tail_span = spans[tail_idx]
+
+        if reference_spans is not None:
+            if head_span not in reference_spans or tail_span not in reference_spans:
+                # Skip relations whose entities do not align to any gold entity span.
+                continue
+
         relations.append((head_span, tail_span, rel.get("type", DEFAULT_RELATION_NONE_LABEL)))
     return relations
 
@@ -406,7 +420,7 @@ def build_triple_preference_records(
         )
 
         gold_relations = _extract_gold_relations(human_doc)
-        pred_relations = _extract_pred_relations(model_doc)
+        pred_relations = _extract_pred_relations(model_doc, reference_entities=gold_entities)
         relation_candidates, relation_pref_pairs = _relation_candidates_and_preferences(
             gold_relations, pred_relations, relation_none_label
         )
