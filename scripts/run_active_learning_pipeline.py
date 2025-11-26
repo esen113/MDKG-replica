@@ -178,6 +178,18 @@ def parse_args() -> argparse.Namespace:
         default="None",
         help="Placeholder label written for missing relations in triple-format preferences.",
     )
+    train.add_argument(
+        "--entity-filter-threshold",
+        type=float,
+        default=None,
+        help="Softmax threshold to override None entity predictions during eval (None = use model default).",
+    )
+    train.add_argument(
+        "--rel-filter-threshold",
+        type=float,
+        default=None,
+        help="Sigmoid threshold applied to relation logits during eval (None = use model default).",
+    )
 
     al = parser.add_argument_group("Active learning")
     al.add_argument(
@@ -399,6 +411,8 @@ def run_training(
     dpo_preferences: str | None = None,
     dpo_train_batch: int | None = None,
     dpo_format: str = "doc",
+    entity_filter_threshold: float | None = None,
+    rel_filter_threshold: float | None = None,
 ) -> tuple[Path, Path]:
     print(f"[TRAIN] Starting training run '{label_suffix}'.")
     cmd = [
@@ -429,6 +443,10 @@ def run_training(
         "--ft_mode",
         ft_mode,
     ]
+    if entity_filter_threshold is not None:
+        cmd.extend(["--entity_filter_threshold", str(entity_filter_threshold)])
+    if rel_filter_threshold is not None:
+        cmd.extend(["--rel_filter_threshold", str(rel_filter_threshold)])
     if ft_mode == "dpo":
         cmd.extend(
             [
@@ -484,6 +502,8 @@ def run_evaluation(
     label: str,
     eval_batch: int,
     al_dump_dir: Path | None = None,
+    entity_filter_threshold: float | None = None,
+    rel_filter_threshold: float | None = None,
 ) -> Path:
     cmd = [
         "python",
@@ -503,6 +523,10 @@ def run_evaluation(
         "--save_path",
         str(SAVE_DIR),
     ]
+    if entity_filter_threshold is not None:
+        cmd.extend(["--entity_filter_threshold", str(entity_filter_threshold)])
+    if rel_filter_threshold is not None:
+        cmd.extend(["--rel_filter_threshold", str(rel_filter_threshold)])
     if al_dump_dir is not None:
         cmd.extend(["--al_dump_dir", str(al_dump_dir)])
     run_command(cmd, cwd=REPO_ROOT)
@@ -678,6 +702,8 @@ def main() -> None:
         train_batch=args.train_batch_size,
         eval_batch=args.eval_batch_size,
         ft_mode="sft",
+        entity_filter_threshold=args.entity_filter_threshold,
+        rel_filter_threshold=args.rel_filter_threshold,
     )
     base_model = final_model_path(base_save_dir)
 
@@ -686,6 +712,8 @@ def main() -> None:
         dataset_path=valid_path,
         label="active_learning_eval_round0",
         eval_batch=args.eval_batch_size,
+        entity_filter_threshold=args.entity_filter_threshold,
+        rel_filter_threshold=args.rel_filter_threshold,
     )
 
     baseline_summary = {
@@ -713,6 +741,8 @@ def main() -> None:
             dataset_path=dpo_seed_path,
             label=seed_eval_label,
             eval_batch=args.eval_batch_size,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
         )
         seed_pred_path = seed_eval_dir / "predictions_test_epoch_0.json"
         seed_predictions = load_json(seed_pred_path)
@@ -759,6 +789,8 @@ def main() -> None:
             dpo_preferences=str(preference_archive),
             dpo_train_batch=args.dpo_train_batch_size,
             dpo_format=args.dpo_preference_format,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
         )
         current_model = final_model_path(initial_dpo_save_dir)
         initial_dpo_eval_dir = run_evaluation(
@@ -766,6 +798,8 @@ def main() -> None:
             dataset_path=valid_path,
             label="active_learning_eval_dpo_seed_round0",
             eval_batch=args.eval_batch_size,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
         )
     elif seed_pref_count == 0:
         print("[WARN] Initial DPO stage skipped: no preference pairs from the seed subset.")
@@ -803,6 +837,8 @@ def main() -> None:
             label=pool_eval_label,
             eval_batch=args.eval_batch_size,
             al_dump_dir=al_dump_dir,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
         )
 
         predictions_path = pool_eval_dir / "predictions_test_epoch_0.json"
@@ -931,6 +967,8 @@ def main() -> None:
             dataset_path=selected_doc_path,
             label=baseline_selected_eval_label,
             eval_batch=args.eval_batch_size,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
         )
         baseline_selected_pred_path = baseline_selected_eval_dir / "predictions_test_epoch_0.json"
         baseline_selected_predictions = load_json(baseline_selected_pred_path)
@@ -972,20 +1010,24 @@ def main() -> None:
                 ft_mode="dpo",
                 dpo_beta=args.dpo_beta,
                 dpo_lambda=args.dpo_lambda,
-                dpo_negatives=args.dpo_negatives,
-                dpo_reference=dpo_reference_model,
-                dpo_preferences=str(preference_archive),
-                dpo_train_batch=args.dpo_train_batch_size,
-                dpo_format=args.dpo_preference_format,
-            )
-            current_model = final_model_path(dpo_save_dir)
-            dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
-            dpo_eval_dir = run_evaluation(
-                model_dir=current_model,
-                dataset_path=valid_path,
-                label=dpo_eval_label,
-                eval_batch=args.eval_batch_size,
-            )
+            dpo_negatives=args.dpo_negatives,
+            dpo_reference=dpo_reference_model,
+            dpo_preferences=str(preference_archive),
+            dpo_train_batch=args.dpo_train_batch_size,
+            dpo_format=args.dpo_preference_format,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
+        )
+        current_model = final_model_path(dpo_save_dir)
+        dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
+        dpo_eval_dir = run_evaluation(
+            model_dir=current_model,
+            dataset_path=valid_path,
+            label=dpo_eval_label,
+            eval_batch=args.eval_batch_size,
+            entity_filter_threshold=args.entity_filter_threshold,
+            rel_filter_threshold=args.rel_filter_threshold,
+        )
         elif preference_count == 0:
             pass
         else:
