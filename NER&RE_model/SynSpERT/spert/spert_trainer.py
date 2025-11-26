@@ -124,8 +124,15 @@ class SpERTTrainer(BaseTrainer):
         self._init_eval_logging(valid_label)
 
         # read datasets
-        input_reader = input_reader_cls(types_path, self._tokenizer, args.neg_entity_count,
-                                        args.neg_relation_count, args.max_span_size, self._logger)
+        input_reader = input_reader_cls(
+            types_path,
+            self._tokenizer,
+            args.neg_entity_count,
+            args.neg_relation_count,
+            args.max_span_size,
+            self._logger,
+            use_gold_eval_spans=getattr(args, "eval_use_gold_spans", False),
+        )
         input_reader.read({train_label: train_path, valid_label: valid_path})
         self._log_datasets(input_reader)
 
@@ -318,8 +325,13 @@ class SpERTTrainer(BaseTrainer):
         self._init_eval_logging(dataset_label)
 
         # read datasets
-        input_reader = input_reader_cls(types_path, self._tokenizer,
-                                        max_span_size=args.max_span_size, logger=self._logger)
+        input_reader = input_reader_cls(
+            types_path,
+            self._tokenizer,
+            max_span_size=args.max_span_size,
+            logger=self._logger,
+            use_gold_eval_spans=getattr(args, "eval_use_gold_spans", False),
+        )
         input_reader.read({dataset_label: dataset_path})
         self._log_datasets(input_reader)
 
@@ -664,7 +676,8 @@ class SpERTTrainer(BaseTrainer):
             model = model.module
 
         evaluator = Evaluator(dataset, input_reader, self._tokenizer,
-                              self.args.rel_filter_threshold, self.args.no_overlapping, self._predictions_path,
+                              self.args.rel_filter_threshold, getattr(self.args, "entity_filter_threshold", 0.0),
+                              self.args.no_overlapping, self._predictions_path,
                               self._examples_path, self.args.example_count, epoch, dataset.label)
 
         dataset.switch_mode(Dataset.EVAL_MODE)

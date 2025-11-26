@@ -194,25 +194,33 @@ def create_train_sample(doc, neg_entity_count: int, neg_rel_count: int, max_span
                 dephead= dephead, deplabel=deplabel, pos =pos)
 
 
-def create_eval_sample(doc, max_span_size: int):
+def create_eval_sample(doc, max_span_size: int, use_gold_spans: bool = False):
     encodings = doc.encoding
     token_count = len(doc.tokens)
     context_size = len(encodings)
     
     dephead, deplabel, pos = add_syntax_info(doc, context_size)  #DKS, TYSS
 
-    
     # create entity candidates
     entity_spans = []
     entity_masks = []
     entity_sizes = []
 
-    for size in range(1, max_span_size + 1):
-        for i in range(0, (token_count - size) + 1):
-            span = doc.tokens[i:i + size].span
-            entity_spans.append(span)
-            entity_masks.append(create_entity_mask(*span, context_size))
-            entity_sizes.append(size)
+    if use_gold_spans:
+        for span in _extract_entity_spans(doc):
+            start, end = span
+            if start is None or end is None or end <= start:
+                continue
+            entity_spans.append((start, end))
+            entity_masks.append(create_entity_mask(start, end, context_size))
+            entity_sizes.append(end - start)
+    else:
+        for size in range(1, max_span_size + 1):
+            for i in range(0, (token_count - size) + 1):
+                span = doc.tokens[i:i + size].span
+                entity_spans.append(span)
+                entity_masks.append(create_entity_mask(*span, context_size))
+                entity_sizes.append(size)
 
     # create tensors
     # token indices

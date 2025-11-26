@@ -369,13 +369,14 @@ class Dataset(TorchDataset):
     EVAL_MODE = 'eval'
 
     def __init__(self, label, rel_types, entity_types, neg_entity_count,
-                 neg_rel_count, max_span_size):
+                 neg_rel_count, max_span_size, use_gold_eval_spans: bool = False):
         self._label = label
         self._rel_types = rel_types
         self._entity_types = entity_types
         self._neg_entity_count = neg_entity_count
         self._neg_rel_count = neg_rel_count
         self._max_span_size = max_span_size
+        self._use_gold_eval_spans = use_gold_eval_spans
         self._mode = Dataset.TRAIN_MODE
 
         self._documents = OrderedDict()
@@ -433,7 +434,7 @@ class Dataset(TorchDataset):
                                                 self._max_span_size, len(self._rel_types))
         else:
             from spert import sampling
-            return sampling.create_eval_sample(doc, self._max_span_size)
+            return sampling.create_eval_sample(doc, self._max_span_size, use_gold_spans=self._use_gold_eval_spans)
 
     def switch_mode(self, mode):
         self._mode = mode

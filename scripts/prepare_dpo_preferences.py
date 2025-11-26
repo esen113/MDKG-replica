@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_RELATION_NONE_LABEL,
         help="Label name representing the absence of a relation (defaults to 'None').",
     )
+    parser.add_argument(
+        "--gold-only-candidates",
+        action="store_true",
+        help="Restrict triple-format candidates to gold spans/pairs only (no hallucinated spans).",
+    )
     return parser.parse_args()
 
 
@@ -265,6 +270,7 @@ def _entity_candidates_and_preferences(
     gold_entities: Sequence[EntityTriplet],
     pred_entities: Sequence[EntityTriplet],
     none_label: str,
+    gold_only: bool = False,
 ) -> Tuple[List[Dict[str, Any]], PreferencePairs]:
     gold_by_span: Dict[Tuple[int, int], set[str]] = defaultdict(set)
     pred_by_span: Dict[Tuple[int, int], set[str]] = defaultdict(set)
@@ -287,8 +293,9 @@ def _entity_candidates_and_preferences(
 
         for label in gold_types:
             _add_candidate(span, label)
-        for label in pred_types:
-            _add_candidate(span, label)
+        if not gold_only:
+            for label in pred_types:
+                _add_candidate(span, label)
 
         if pred_types:
             for label in gold_types:
@@ -302,12 +309,13 @@ def _entity_candidates_and_preferences(
 
         pred_by_span.pop(span, None)
 
-    for span in sorted(pred_by_span.keys()):
-        pred_types = sorted(pred_by_span[span])
-        none_candidate = _add_candidate(span, none_label)
-        for label in pred_types:
-            hallucination = _add_candidate(span, label)
-            prefs.append((none_candidate, hallucination))
+    if not gold_only:
+        for span in sorted(pred_by_span.keys()):
+            pred_types = sorted(pred_by_span[span])
+            none_candidate = _add_candidate(span, none_label)
+            for label in pred_types:
+                hallucination = _add_candidate(span, label)
+                prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_entity_sort_key)
     candidate_map = {cand: idx for idx, cand in enumerate(ordered_candidates)}
@@ -326,6 +334,7 @@ def _relation_candidates_and_preferences(
     gold_relations: Sequence[RelationTriplet],
     pred_relations: Sequence[RelationTriplet],
     none_label: str,
+    gold_only: bool = False,
 ) -> Tuple[List[Dict[str, Any]], PreferencePairs]:
     gold_by_pair: Dict[Tuple[Span, Span], set[str]] = defaultdict(set)
     pred_by_pair: Dict[Tuple[Span, Span], set[str]] = defaultdict(set)
@@ -348,8 +357,9 @@ def _relation_candidates_and_preferences(
 
         for label in gold_types:
             _add_candidate(pair, label)
-        for label in pred_types:
-            _add_candidate(pair, label)
+        if not gold_only:
+            for label in pred_types:
+                _add_candidate(pair, label)
 
         if pred_types:
             for label in gold_types:
@@ -363,12 +373,13 @@ def _relation_candidates_and_preferences(
 
         pred_by_pair.pop(pair, None)
 
-    for pair in sorted(pred_by_pair.keys(), key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1])):
-        pred_types = sorted(pred_by_pair[pair])
-        none_candidate = _add_candidate(pair, none_label)
-        for label in pred_types:
-            hallucination = _add_candidate(pair, label)
-            prefs.append((none_candidate, hallucination))
+    if not gold_only:
+        for pair in sorted(pred_by_pair.keys(), key=lambda p: (p[0][0], p[0][1], p[1][0], p[1][1])):
+            pred_types = sorted(pred_by_pair[pair])
+            none_candidate = _add_candidate(pair, none_label)
+            for label in pred_types:
+                hallucination = _add_candidate(pair, label)
+                prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_relation_sort_key)
     candidate_map = {cand: idx for idx, cand in enumerate(ordered_candidates)}
@@ -404,6 +415,7 @@ def build_triple_preference_records(
     max_relation_prefs: int = 50,
     entity_none_label: str = DEFAULT_ENTITY_NONE_LABEL,
     relation_none_label: str = DEFAULT_RELATION_NONE_LABEL,
+    gold_only_candidates: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int]:
     records: List[Dict[str, Any]] = []
     skipped = 0
@@ -416,13 +428,13 @@ def build_triple_preference_records(
         gold_entities = _extract_gold_entities(human_doc)
         pred_entities = _extract_pred_entities(model_doc)
         entity_candidates, entity_pref_pairs = _entity_candidates_and_preferences(
-            gold_entities, pred_entities, entity_none_label
+            gold_entities, pred_entities, entity_none_label, gold_only=gold_only_candidates
         )
 
         gold_relations = _extract_gold_relations(human_doc)
         pred_relations = _extract_pred_relations(model_doc, reference_entities=gold_entities)
         relation_candidates, relation_pref_pairs = _relation_candidates_and_preferences(
-            gold_relations, pred_relations, relation_none_label
+            gold_relations, pred_relations, relation_none_label, gold_only=gold_only_candidates
         )
 
         if not entity_pref_pairs and not relation_pref_pairs:
@@ -476,6 +488,7 @@ def prepare_preference_records(
     max_relation_prefs: int,
     entity_none_label: str,
     relation_none_label: str,
+    gold_only_candidates: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int]:
     if fmt == "doc":
         return build_doc_preference_records(human_docs, model_docs, prompt_template)
@@ -487,6 +500,7 @@ def prepare_preference_records(
         max_relation_prefs=max_relation_prefs,
         entity_none_label=entity_none_label,
         relation_none_label=relation_none_label,
+        gold_only_candidates=gold_only_candidates,
     )
 
 
@@ -514,6 +528,7 @@ def main() -> None:
         args.max_relation_prefs,
         args.entity_none_label,
         args.relation_none_label,
+        gold_only_candidates=args.gold_only_candidates,
     )
 
     with output_path.open("w", encoding="utf-8") as fout:

@@ -17,12 +17,13 @@ SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 
 class Evaluator:
     def __init__(self, dataset: Dataset, input_reader: JsonInputReader, text_encoder: BertTokenizer,
-                 rel_filter_threshold: float, no_overlapping: bool,
+                 rel_filter_threshold: float, entity_filter_threshold: float, no_overlapping: bool,
                  predictions_path: str, examples_path: str, example_count: int, epoch: int, dataset_label: str):
         self._text_encoder = text_encoder
         self._input_reader = input_reader
         self._dataset = dataset
         self._rel_filter_threshold = rel_filter_threshold
+        self._entity_filter_threshold = entity_filter_threshold
         self._no_overlapping = no_overlapping
 
         self._epoch = epoch
@@ -50,8 +51,13 @@ class Evaluator:
         batch_size = batch_rel_clf.shape[0]
         rel_class_count = batch_rel_clf.shape[2]
 
-        # get maximum activation (index of predicted entity type)
+        # entity type prediction with optional None override threshold
         batch_entity_types = batch_entity_clf.argmax(dim=-1)
+        if getattr(self, "_entity_filter_threshold", 0.0) > 0:
+            probs = torch.softmax(batch_entity_clf, dim=-1)
+            non_none_probs, non_none_idx = probs[..., 1:].max(dim=-1)
+            override = non_none_probs >= self._entity_filter_threshold
+            batch_entity_types = torch.where(override, non_none_idx + 1, batch_entity_types)
         # apply entity sample mask
         batch_entity_types *= batch['entity_sample_masks'].long()
 
@@ -652,4 +658,3 @@ class Evaluator:
 
         # write to disc
         template.stream(examples=examples).dump(file_path)
-

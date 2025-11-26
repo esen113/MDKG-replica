@@ -23,6 +23,7 @@ class BaseInputReader:
         max_span_size: int,
         logger=None,
         max_seq_length: Optional[int] = None,
+        use_gold_eval_spans: bool = False,
     ):
         self._types_path = types_path
         self._tokenizer = tokenizer
@@ -30,6 +31,7 @@ class BaseInputReader:
         self._neg_relation_count = neg_relation_count
         self._max_span_size = max_span_size
         self._logger = logger
+        self._use_gold_eval_spans = use_gold_eval_spans
 
         self._datasets: Dict[str, Dataset] = OrderedDict()
         self._entity_types: Dict[str, EntityType] = OrderedDict()
@@ -98,6 +100,7 @@ class BaseInputReader:
                 neg_entity_count=self._neg_entity_count,
                 neg_rel_count=self._neg_relation_count,
                 max_span_size=self._max_span_size,
+                use_gold_eval_spans=self._use_gold_eval_spans,
             )
             dataset._input_reader = self  # type: ignore[attr-defined]
 
@@ -162,6 +165,7 @@ class JsonInputReader(BaseInputReader):
         neg_relation_count: int = 0,
         max_span_size: int = 10,
         logger=None,
+        use_gold_eval_spans: bool = False,
     ):
         super().__init__(
             types_path=types_path,
@@ -170,6 +174,7 @@ class JsonInputReader(BaseInputReader):
             neg_relation_count=neg_relation_count,
             max_span_size=max_span_size,
             logger=logger,
+            use_gold_eval_spans=use_gold_eval_spans,
         )
 
         self._cls_token_id = tokenizer.cls_token_id

@@ -9,9 +9,15 @@ from spert.input_reader import BaseInputReader
 
 def convert_predictions(batch_entity_clf: torch.tensor, batch_rel_clf: torch.tensor,
                         batch_rels: torch.tensor, batch: dict, rel_filter_threshold: float,
-                        input_reader: BaseInputReader, no_overlapping: bool = False):
+                        input_reader: BaseInputReader, no_overlapping: bool = False,
+                        entity_filter_threshold: float = 0.0):
     # get maximum activation (index of predicted entity type)
     batch_entity_types = batch_entity_clf.argmax(dim=-1)
+    if entity_filter_threshold > 0:
+        probs = torch.softmax(batch_entity_clf, dim=-1)
+        non_none_probs, non_none_idx = probs[..., 1:].max(dim=-1)
+        override = non_none_probs >= entity_filter_threshold
+        batch_entity_types = torch.where(override, non_none_idx + 1, batch_entity_types)
     # apply entity sample mask
     batch_entity_types *= batch['entity_sample_masks'].long()
 

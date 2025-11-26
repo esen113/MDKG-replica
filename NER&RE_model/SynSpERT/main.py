@@ -46,6 +46,8 @@ NEG_RELATION_COUNT = 100
 TRAIN_LOG_ITER = 1
 SAVE_OPTIMIZER_ENABLED = False
 FINAL_EVAL_ENABLED = False
+REL_FILTER_THRESHOLD = 0.1
+ENTITY_FILTER_THRESHOLD = 0.05
 FT_MODE = "sft"
 DPO_TRAIN_BATCH_SIZE: int | None = None
 DPO_BETA = 0.1
@@ -167,7 +169,9 @@ def build_train_args() -> list:
         "--max_span_size",
         "10",
         "--rel_filter_threshold",
-        "0.5",
+        str(REL_FILTER_THRESHOLD),
+        "--entity_filter_threshold",
+        str(ENTITY_FILTER_THRESHOLD),
         "--max_pairs",
         "1000",
         "--sampling_processes",

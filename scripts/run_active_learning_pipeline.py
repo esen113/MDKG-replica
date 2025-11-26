@@ -152,6 +152,11 @@ def parse_args() -> argparse.Namespace:
         help="Schema used for generated DPO preferences ('triple' enables candidate-level supervision).",
     )
     train.add_argument(
+        "--dpo-gold-only-candidates",
+        action="store_true",
+        help="Restrict triple-format DPO candidates to gold spans/pairs only (no hallucinated spans).",
+    )
+    train.add_argument(
         "--dpo-max-entity-prefs",
         type=int,
         default=50,
@@ -589,6 +594,7 @@ def build_dpo_preferences(
     max_relation_prefs: int,
     entity_none_label: str,
     relation_none_label: str,
+    gold_only_candidates: bool,
 ) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     records, skipped = prepare_preference_records(
@@ -600,6 +606,7 @@ def build_dpo_preferences(
         max_relation_prefs,
         entity_none_label,
         relation_none_label,
+        gold_only_candidates=gold_only_candidates,
     )
 
     with output_jsonl.open("w", encoding="utf-8") as fout:
@@ -718,6 +725,7 @@ def main() -> None:
             max_relation_prefs=args.dpo_max_relation_prefs,
             entity_none_label=args.dpo_entity_none_label,
             relation_none_label=args.dpo_relation_none_label,
+            gold_only_candidates=args.dpo_gold_only_candidates,
         )
     else:
         seed_pref_path.touch()
@@ -938,6 +946,7 @@ def main() -> None:
             max_relation_prefs=args.dpo_max_relation_prefs,
             entity_none_label=args.dpo_entity_none_label,
             relation_none_label=args.dpo_relation_none_label,
+            gold_only_candidates=args.dpo_gold_only_candidates,
         )
         if preference_count > 0:
             append_jsonl(preference_jsonl, preference_archive)
