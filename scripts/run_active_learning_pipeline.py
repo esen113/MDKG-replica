@@ -1010,24 +1010,24 @@ def main() -> None:
                 ft_mode="dpo",
                 dpo_beta=args.dpo_beta,
                 dpo_lambda=args.dpo_lambda,
-            dpo_negatives=args.dpo_negatives,
-            dpo_reference=dpo_reference_model,
-            dpo_preferences=str(preference_archive),
-            dpo_train_batch=args.dpo_train_batch_size,
-            dpo_format=args.dpo_preference_format,
-            entity_filter_threshold=args.entity_filter_threshold,
-            rel_filter_threshold=args.rel_filter_threshold,
-        )
-        current_model = final_model_path(dpo_save_dir)
-        dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
-        dpo_eval_dir = run_evaluation(
-            model_dir=current_model,
-            dataset_path=valid_path,
-            label=dpo_eval_label,
-            eval_batch=args.eval_batch_size,
-            entity_filter_threshold=args.entity_filter_threshold,
-            rel_filter_threshold=args.rel_filter_threshold,
-        )
+                dpo_negatives=args.dpo_negatives,
+                dpo_reference=dpo_reference_model,
+                dpo_preferences=str(preference_archive),
+                dpo_train_batch=args.dpo_train_batch_size,
+                dpo_format=args.dpo_preference_format,
+                entity_filter_threshold=args.entity_filter_threshold,
+                rel_filter_threshold=args.rel_filter_threshold,
+            )
+            current_model = final_model_path(dpo_save_dir)
+            dpo_eval_label = f"active_learning_eval_dpo_round{round_idx}"
+            dpo_eval_dir = run_evaluation(
+                model_dir=current_model,
+                dataset_path=valid_path,
+                label=dpo_eval_label,
+                eval_batch=args.eval_batch_size,
+                entity_filter_threshold=args.entity_filter_threshold,
+                rel_filter_threshold=args.rel_filter_threshold,
+            )
         elif preference_count == 0:
             pass
         else:
