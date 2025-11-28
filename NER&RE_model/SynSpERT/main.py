@@ -261,7 +261,9 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
         "--max_span_size",
         "10",
         "--rel_filter_threshold",
-        "0.5",
+        str(REL_FILTER_THRESHOLD),
+        "--entity_filter_threshold",
+        str(ENTITY_FILTER_THRESHOLD),
         "--max_pairs",
         "1000",
         "--sampling_processes",
@@ -378,6 +380,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_log_iter", type=int, default=TRAIN_LOG_ITER)
     parser.add_argument("--save_optimizer", action="store_true", default=SAVE_OPTIMIZER_ENABLED)
     parser.add_argument("--final_eval", action="store_true", default=FINAL_EVAL_ENABLED)
+    parser.add_argument("--rel_filter_threshold", type=float, default=REL_FILTER_THRESHOLD)
+    parser.add_argument("--entity_filter_threshold", type=float, default=ENTITY_FILTER_THRESHOLD)
     parser.add_argument("--ft_mode", choices=["sft", "dpo"], default=FT_MODE)
     parser.add_argument("--dpo_train_batch_size", type=int, default=None,
                         help="Batch size used for DPO preference loader; defaults to --train_batch_size.")
@@ -399,7 +403,7 @@ def main():
     global TRAIN_EPOCHS, NOISE_LAMBDA, NEG_ENTITY_COUNT, NEG_RELATION_COUNT, TRAIN_LOG_ITER
     global FT_MODE, DPO_BETA, DPO_LAMBDA, DPO_NEGATIVES, DPO_REFERENCE, DPO_PREFERENCES, DPO_TRAIN_BATCH_SIZE
     global DPO_FORMAT, DPO_LAMBDA_ENTITY, DPO_LAMBDA_RELATION
-    global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED
+    global SAVE_OPTIMIZER_ENABLED, FINAL_EVAL_ENABLED, REL_FILTER_THRESHOLD, ENTITY_FILTER_THRESHOLD
 
     LOG_PATH = Path(args.log_path).expanduser().resolve()
     SAVE_PATH = Path(args.save_path).expanduser().resolve()
@@ -428,6 +432,8 @@ def main():
     TRAIN_LOG_ITER = args.train_log_iter
     SAVE_OPTIMIZER_ENABLED = args.save_optimizer
     FINAL_EVAL_ENABLED = args.final_eval
+    REL_FILTER_THRESHOLD = args.rel_filter_threshold
+    ENTITY_FILTER_THRESHOLD = args.entity_filter_threshold
     FT_MODE = args.ft_mode
     DPO_TRAIN_BATCH_SIZE = args.dpo_train_batch_size
     DPO_BETA = args.dpo_beta
