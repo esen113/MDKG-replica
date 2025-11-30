@@ -77,13 +77,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-entity-prefs",
         type=int,
-        default=50,
+        default=200,
         help="Maximum entity-level preference pairs to retain per document (0 = unlimited).",
     )
     parser.add_argument(
         "--max-relation-prefs",
         type=int,
-        default=50,
+        default=200,
         help="Maximum relation-level preference pairs to retain per document (0 = unlimited).",
     )
     parser.add_argument(
@@ -316,14 +316,14 @@ def _entity_candidates_and_preferences(
 
     if not gold_only:
         for span in sorted(pred_by_span.keys()):
-            # 如果一个预测 span 与任意 gold span 重叠且 gold 已存在，丢弃，避免相似跨度造成幻觉。
+            # 与任一 gold span 重叠则跳过，避免相似跨度被当成幻觉
             if any(not (span[1] <= g_start or span[0] >= g_end) for g_start, g_end in gold_spans):
                 continue
             pred_types = sorted(pred_by_span[span])
             none_candidate = _add_candidate(span, none_label)
             for label in pred_types:
                 hallucination = _add_candidate(span, label)
-                # 输入不一致，输出有：None > pred（幻觉）
+                # 非 gold 输入：None 作为正，模型预测为负
                 prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_entity_sort_key)
@@ -421,8 +421,8 @@ def build_triple_preference_records(
     human_docs: Sequence[Dict[str, Any]],
     model_docs: Sequence[Dict[str, Any]],
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE,
-    max_entity_prefs: int = 50,
-    max_relation_prefs: int = 50,
+    max_entity_prefs: int = 200,
+    max_relation_prefs: int = 200,
     entity_none_label: str = DEFAULT_ENTITY_NONE_LABEL,
     relation_none_label: str = DEFAULT_RELATION_NONE_LABEL,
     gold_only_candidates: bool = False,
@@ -442,6 +442,7 @@ def build_triple_preference_records(
         )
 
         gold_relations = _extract_gold_relations(human_doc)
+        # 只接受 head/tail 对齐到 gold span 的预测关系
         pred_relations = _extract_pred_relations(model_doc, reference_entities=gold_entities)
         relation_candidates, relation_pref_pairs = _relation_candidates_and_preferences(
             gold_relations, pred_relations, relation_none_label, gold_only=gold_only_candidates
