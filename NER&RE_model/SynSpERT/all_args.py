@@ -48,10 +48,10 @@ def get_argparser():
     arg_parser.add_argument('--eval_batch_size', type=int, default=1, help="Evaluation batch size")
     arg_parser.add_argument('--max_pairs', type=int, default=1000,
                             help="Maximum entity pairs to process during training/evaluation")
-    arg_parser.add_argument('--rel_filter_threshold', type=float, default=0.1,
+    arg_parser.add_argument('--rel_filter_threshold', type=float, default=0.5,
                             help="Sigmoid threshold for relations; lower = higher recall.")
-    arg_parser.add_argument('--entity_filter_threshold', type=float, default=0.05,
-                            help="Minimum non-none softmax prob to override a None entity prediction.")
+    arg_parser.add_argument('--entity_filter_threshold', type=float, default=0.0,
+                            help="Minimum non-none softmax prob to override a None entity prediction (0 to disable).")
     arg_parser.add_argument('--eval_use_gold_spans', action='store_true', default=False,
                             help="Diagnostic: build eval blueprints from gold spans instead of full enumeration.")
     arg_parser.add_argument('--size_embedding', type=int, default=25, help="Dimensionality of size embedding")

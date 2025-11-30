@@ -276,6 +276,7 @@ def _entity_candidates_and_preferences(
     pred_by_span: Dict[Tuple[int, int], set[str]] = defaultdict(set)
     for start, end, label in gold_entities:
         gold_by_span[(start, end)].add(label)
+    gold_spans = list(gold_by_span.keys())
     for start, end, label in pred_entities:
         pred_by_span[(start, end)].add(label)
 
@@ -293,16 +294,20 @@ def _entity_candidates_and_preferences(
 
         for label in gold_types:
             _add_candidate(span, label)
-        if not gold_only:
-            for label in pred_types:
-                _add_candidate(span, label)
-
         if pred_types:
+            # 输入一致，输出不一致：gold > pred（不含与 gold 相同的标签）
             for label in gold_types:
                 for pred_label in pred_types:
-                    if label != pred_label:
+                    if pred_label != label:
+                        _add_candidate(span, pred_label)
                         prefs.append(((span[0], span[1], label), (span[0], span[1], pred_label)))
+            # gold 标签未被输出：gold > None
+            none_candidate = _add_candidate(span, none_label)
+            for label in gold_types:
+                if label not in pred_types:
+                    prefs.append(((span[0], span[1], label), none_candidate))
         else:
+            # 输入一致，模型未输出：gold > None
             none_candidate = _add_candidate(span, none_label)
             for label in gold_types:
                 prefs.append(((span[0], span[1], label), none_candidate))
@@ -311,10 +316,14 @@ def _entity_candidates_and_preferences(
 
     if not gold_only:
         for span in sorted(pred_by_span.keys()):
+            # 如果一个预测 span 与任意 gold span 重叠且 gold 已存在，丢弃，避免相似跨度造成幻觉。
+            if any(not (span[1] <= g_start or span[0] >= g_end) for g_start, g_end in gold_spans):
+                continue
             pred_types = sorted(pred_by_span[span])
             none_candidate = _add_candidate(span, none_label)
             for label in pred_types:
                 hallucination = _add_candidate(span, label)
+                # 输入不一致，输出有：None > pred（幻觉）
                 prefs.append((none_candidate, hallucination))
 
     ordered_candidates = sorted(candidates, key=_entity_sort_key)
@@ -357,15 +366,16 @@ def _relation_candidates_and_preferences(
 
         for label in gold_types:
             _add_candidate(pair, label)
-        if not gold_only:
-            for label in pred_types:
-                _add_candidate(pair, label)
-
         if pred_types:
             for label in gold_types:
                 for pred_label in pred_types:
-                    if label != pred_label:
+                    if pred_label != label:
+                        _add_candidate(pair, pred_label)
                         prefs.append(((pair[0], pair[1], label), (pair[0], pair[1], pred_label)))
+            none_candidate = _add_candidate(pair, none_label)
+            for label in gold_types:
+                if label not in pred_types:
+                    prefs.append(((pair[0], pair[1], label), none_candidate))
         else:
             none_candidate = _add_candidate(pair, none_label)
             for label in gold_types:
