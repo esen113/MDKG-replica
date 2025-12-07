@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -87,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum relation-level preference pairs to retain per document (0 = unlimited).",
     )
     parser.add_argument(
+        "--max-span-size",
+        type=int,
+        default=10,
+        help="Maximum span size considered when sampling background entity spans.",
+    )
+    parser.add_argument(
         "--entity-none-label",
         default=DEFAULT_ENTITY_NONE_LABEL,
         help="Label name representing the absence of an entity (defaults to 'None').",
@@ -100,6 +107,18 @@ def parse_args() -> argparse.Namespace:
         "--gold-only-candidates",
         action="store_true",
         help="Restrict triple-format candidates to gold spans/pairs only (no hallucinated spans).",
+    )
+    parser.add_argument(
+        "--dpo-entity-bg-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of entity background prefs (None>fake) relative to (gold+hallucination) prefs per doc.",
+    )
+    parser.add_argument(
+        "--dpo-relation-bg-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of relation background prefs (None>fake) relative to (gold+hallucination) prefs per doc.",
     )
     return parser.parse_args()
 
@@ -266,6 +285,71 @@ def _limit_preferences(preferences: List[Dict[str, int]], limit: int) -> List[Di
     return preferences
 
 
+def sample_background_entity_spans(
+    tokens: Sequence[str],
+    gold_entities: Sequence[EntityTriplet],
+    pred_entities: Sequence[EntityTriplet],
+    max_span_size: int,
+    max_bg: int,
+) -> List[Span]:
+    """
+    Sample background spans that are neither gold nor predicted entities.
+    """
+    if max_bg <= 0:
+        return []
+
+    total_tokens = len(tokens)
+    gold_spans = {(s, e) for (s, e, _) in gold_entities}
+    pred_spans = {(s, e) for (s, e, _) in pred_entities}
+
+    bg_spans: List[Span] = []
+    for size in range(1, max_span_size + 1):
+        for i in range(0, total_tokens - size + 1):
+            span = (i, i + size)
+            if span in gold_spans or span in pred_spans:
+                continue
+            bg_spans.append(span)
+
+    if not bg_spans:
+        return []
+
+    random.shuffle(bg_spans)
+    return bg_spans[:max_bg]
+
+
+def sample_background_relation_pairs(
+    entity_spans: Sequence[Span],
+    gold_relations: Sequence[RelationTriplet],
+    pred_relations: Sequence[RelationTriplet],
+    max_bg: int,
+) -> List[Tuple[Span, Span]]:
+    """
+    Sample background relation pairs from existing entity spans, excluding gold/pred pairs.
+    """
+    if max_bg <= 0:
+        return []
+
+    gold_pairs = {(h, t) for (h, t, _) in gold_relations}
+    pred_pairs = {(h, t) for (h, t, _) in pred_relations}
+
+    unique_spans = list({(s, e) for (s, e) in entity_spans})
+    bg_pairs: List[Tuple[Span, Span]] = []
+    for h_span in unique_spans:
+        for t_span in unique_spans:
+            if h_span == t_span:
+                continue
+            pair = (h_span, t_span)
+            if pair in gold_pairs or pair in pred_pairs:
+                continue
+            bg_pairs.append(pair)
+
+    if not bg_pairs:
+        return []
+
+    random.shuffle(bg_pairs)
+    return bg_pairs[:max_bg]
+
+
 def _entity_candidates_and_preferences(
     gold_entities: Sequence[EntityTriplet],
     pred_entities: Sequence[EntityTriplet],
@@ -426,6 +510,9 @@ def build_triple_preference_records(
     entity_none_label: str = DEFAULT_ENTITY_NONE_LABEL,
     relation_none_label: str = DEFAULT_RELATION_NONE_LABEL,
     gold_only_candidates: bool = False,
+    entity_bg_ratio: float = 0.0,
+    relation_bg_ratio: float = 0.0,
+    max_span_size: int = 10,
 ) -> Tuple[List[Dict[str, Any]], int]:
     records: List[Dict[str, Any]] = []
     skipped = 0
@@ -447,6 +534,89 @@ def build_triple_preference_records(
         relation_candidates, relation_pref_pairs = _relation_candidates_and_preferences(
             gold_relations, pred_relations, relation_none_label, gold_only=gold_only_candidates
         )
+
+        # Track existing candidates for de-duplication when adding backgrounds
+        entity_candidate_map = {
+            (cand["span"][0], cand["span"][1], cand["type"]): idx for idx, cand in enumerate(entity_candidates)
+        }
+        relation_candidate_map = {
+            ((cand["h"][0], cand["h"][1]), (cand["t"][0], cand["t"][1]), cand["type"]): idx
+            for idx, cand in enumerate(relation_candidates)
+        }
+
+        def _ensure_entity_candidate(span: Span, label: str) -> int:
+            key = (span[0], span[1], label)
+            if key in entity_candidate_map:
+                return entity_candidate_map[key]
+            idx = len(entity_candidates)
+            entity_candidates.append({"span": [span[0], span[1]], "type": label})
+            entity_candidate_map[key] = idx
+            return idx
+
+        def _ensure_relation_candidate(head_span: Span, tail_span: Span, label: str) -> int:
+            key = (head_span, tail_span, label)
+            if key in relation_candidate_map:
+                return relation_candidate_map[key]
+            idx = len(relation_candidates)
+            relation_candidates.append(
+                {"h": [head_span[0], head_span[1]], "t": [tail_span[0], tail_span[1]], "type": label}
+            )
+            relation_candidate_map[key] = idx
+            return idx
+
+        # --------------------
+        # Entity background prefs: None > fake_label
+        # --------------------
+        if entity_bg_ratio > 0.0:
+            base_entity_pref_count = len(entity_pref_pairs)
+            target_bg_entities = int(round(entity_bg_ratio * max(base_entity_pref_count, 1)))
+            if target_bg_entities > 0:
+                bg_spans = sample_background_entity_spans(
+                    tokens,
+                    gold_entities,
+                    pred_entities,
+                    max_span_size=max_span_size,
+                    max_bg=target_bg_entities,
+                )
+                observed_labels = {
+                    lab for (_, _, lab) in gold_entities + pred_entities if lab != entity_none_label
+                }
+                observed_labels = sorted(observed_labels)
+
+                for span in bg_spans:
+                    if not observed_labels:
+                        break
+                    fake_label = random.choice(observed_labels)
+                    _ensure_entity_candidate(span, entity_none_label)
+                    _ensure_entity_candidate(span, fake_label)
+                    entity_pref_pairs.append(((span[0], span[1], entity_none_label), (span[0], span[1], fake_label)))
+
+        # --------------------
+        # Relation background prefs: None > fake_relation_type
+        # --------------------
+        if relation_bg_ratio > 0.0:
+            base_relation_pref_count = len(relation_pref_pairs)
+            target_bg_relations = int(round(relation_bg_ratio * max(base_relation_pref_count, 1)))
+            if target_bg_relations > 0:
+                entity_spans = [(s, e) for (s, e, _) in gold_entities]
+                bg_pairs = sample_background_relation_pairs(
+                    entity_spans,
+                    gold_relations,
+                    pred_relations,
+                    max_bg=target_bg_relations,
+                )
+                observed_rel_labels = {
+                    lab for (_, _, lab) in gold_relations + pred_relations if lab != relation_none_label
+                }
+                observed_rel_labels = sorted(observed_rel_labels)
+
+                for h_span, t_span in bg_pairs:
+                    if not observed_rel_labels:
+                        break
+                    fake_rel = random.choice(observed_rel_labels)
+                    _ensure_relation_candidate(h_span, t_span, relation_none_label)
+                    _ensure_relation_candidate(h_span, t_span, fake_rel)
+                    relation_pref_pairs.append(((h_span, t_span, relation_none_label), (h_span, t_span, fake_rel)))
 
         if not entity_pref_pairs and not relation_pref_pairs:
             skipped += 1
@@ -500,6 +670,9 @@ def prepare_preference_records(
     entity_none_label: str,
     relation_none_label: str,
     gold_only_candidates: bool = False,
+    entity_bg_ratio: float = 0.0,
+    relation_bg_ratio: float = 0.0,
+    max_span_size: int = 10,
 ) -> Tuple[List[Dict[str, Any]], int]:
     if fmt == "doc":
         return build_doc_preference_records(human_docs, model_docs, prompt_template)
@@ -512,6 +685,9 @@ def prepare_preference_records(
         entity_none_label=entity_none_label,
         relation_none_label=relation_none_label,
         gold_only_candidates=gold_only_candidates,
+        entity_bg_ratio=entity_bg_ratio,
+        relation_bg_ratio=relation_bg_ratio,
+        max_span_size=max_span_size,
     )
 
 
@@ -540,6 +716,9 @@ def main() -> None:
         args.entity_none_label,
         args.relation_none_label,
         gold_only_candidates=args.gold_only_candidates,
+        entity_bg_ratio=args.dpo_entity_bg_ratio,
+        relation_bg_ratio=args.dpo_relation_bg_ratio,
+        max_span_size=args.max_span_size,
     )
 
     with output_path.open("w", encoding="utf-8") as fout:

@@ -159,14 +159,14 @@ def parse_args() -> argparse.Namespace:
     train.add_argument(
         "--dpo-max-entity-prefs",
         type=int,
-        default=50,
-        help="Maximum entity preference pairs per example when building triple-format preferences.",
+        default=0,
+        help="Maximum entity preference pairs per example when building triple-format preferences (0 = no limit).",
     )
     train.add_argument(
         "--dpo-max-relation-prefs",
         type=int,
-        default=50,
-        help="Maximum relation preference pairs per example when building triple-format preferences.",
+        default=0,
+        help="Maximum relation preference pairs per example when building triple-format preferences (0 = no limit).",
     )
     train.add_argument(
         "--dpo-entity-none-label",
@@ -177,6 +177,24 @@ def parse_args() -> argparse.Namespace:
         "--dpo-relation-none-label",
         default="None",
         help="Placeholder label written for missing relations in triple-format preferences.",
+    )
+    train.add_argument(
+        "--dpo-entity-bg-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of background entity None>fake pairs relative to (gold+hall) prefs per doc (0.0 = disabled).",
+    )
+    train.add_argument(
+        "--dpo-relation-bg-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of background relation None>fake pairs relative to (gold+hall) prefs per doc (0.0 = disabled).",
+    )
+    train.add_argument(
+        "--max-span-size",
+        type=int,
+        default=10,
+        help="Max span size used when sampling background entity spans for DPO preferences.",
     )
     train.add_argument(
         "--entity-filter-threshold",
@@ -619,6 +637,9 @@ def build_dpo_preferences(
     entity_none_label: str,
     relation_none_label: str,
     gold_only_candidates: bool,
+    entity_bg_ratio: float,
+    relation_bg_ratio: float,
+    max_span_size: int,
 ) -> int:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     records, skipped = prepare_preference_records(
@@ -631,6 +652,9 @@ def build_dpo_preferences(
         entity_none_label,
         relation_none_label,
         gold_only_candidates=gold_only_candidates,
+        entity_bg_ratio=entity_bg_ratio,
+        relation_bg_ratio=relation_bg_ratio,
+        max_span_size=max_span_size,
     )
 
     with output_jsonl.open("w", encoding="utf-8") as fout:
@@ -756,6 +780,9 @@ def main() -> None:
             entity_none_label=args.dpo_entity_none_label,
             relation_none_label=args.dpo_relation_none_label,
             gold_only_candidates=args.dpo_gold_only_candidates,
+            entity_bg_ratio=args.dpo_entity_bg_ratio,
+            relation_bg_ratio=args.dpo_relation_bg_ratio,
+            max_span_size=args.max_span_size,
         )
     else:
         seed_pref_path.touch()
@@ -985,6 +1012,9 @@ def main() -> None:
             entity_none_label=args.dpo_entity_none_label,
             relation_none_label=args.dpo_relation_none_label,
             gold_only_candidates=args.dpo_gold_only_candidates,
+            entity_bg_ratio=args.dpo_entity_bg_ratio,
+            relation_bg_ratio=args.dpo_relation_bg_ratio,
+            max_span_size=args.max_span_size,
         )
         if preference_count > 0:
             append_jsonl(preference_jsonl, preference_archive)
