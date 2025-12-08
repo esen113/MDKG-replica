@@ -222,6 +222,7 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
     model_dir = cli_args.model_dir
 
     config_arg = CONFIG_PATH if CONFIG_OVERRIDE_SET else str(model_dir)
+    eval_bs = cli_args.eval_batch_size if hasattr(cli_args, "eval_batch_size") else EVAL_BATCH_SIZE
 
     args = [
         "eval",
@@ -247,7 +248,7 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
         "--use_entity_clf",
         "logits",
         "--eval_batch_size",
-        "2",
+        str(eval_bs),
         "--lr",
         "5e-5",
         "--lr_warmup",
@@ -270,7 +271,6 @@ def build_eval_args(cli_args: argparse.Namespace) -> list:
         "4",
         "--sampling_limit",
         "100",
-        "--store_examples",
         "--log_path",
         str(LOG_PATH),
         "--save_path",
