@@ -150,7 +150,7 @@ def train_ce(train_path: Path, valid_path: Path, bert_model: str) -> Path:
     return model_dir
 
 
-def eval_model(model_dir: Path, dataset: Path, label: str, tokenizer_path: str) -> Dict[str, float]:
+def eval_model(model_dir: Path, dataset: Path, label: str) -> Dict[str, float]:
     log_root = TMP_ROOT / f"log_{label}"
     save_root = TMP_ROOT / f"save_{label}"
     shutil.rmtree(log_root, ignore_errors=True)
@@ -168,8 +168,6 @@ def eval_model(model_dir: Path, dataset: Path, label: str, tokenizer_path: str) 
             str(dataset),
             "--label",
             label,
-            "--tokenizer_path",
-            tokenizer_path,
             "--config_override",
             str(config_path),
             "--eval_batch_size",
@@ -372,14 +370,14 @@ def main() -> None:
     backups = backup_and_swap_dataset(train_path, valid_path)
     try:
         ce_model = train_ce(train_path, valid_path, args.bert_model)
-        ce_metrics = eval_model(ce_model, valid_path, "tiny_ce_eval", args.bert_model)
+        ce_metrics = eval_model(ce_model, valid_path, "tiny_ce_eval")
 
         pred_path = predict_base(train_path, args.bert_model)
         prefs_path = TMP_ROOT / "prefs.jsonl"
         build_prefs(train_path, pred_path, prefs_path)
 
         dpo_model = train_dpo(train_path, valid_path, prefs_path, args.bert_model)
-        dpo_metrics = eval_model(dpo_model, valid_path, "tiny_dpo_eval", args.bert_model)
+        dpo_metrics = eval_model(dpo_model, valid_path, "tiny_dpo_eval")
 
         print("\n=== Summary (tiny set) ===")
         print(f"CE  : NER F1 {ce_metrics['ner_f1']:.2f}, REL F1 {ce_metrics['rel_f1']:.2f}, "
