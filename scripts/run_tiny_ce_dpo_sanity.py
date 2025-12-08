@@ -155,6 +155,7 @@ def eval_model(model_dir: Path, dataset: Path, label: str) -> Dict[str, float]:
     save_root = TMP_ROOT / f"save_{label}"
     shutil.rmtree(log_root, ignore_errors=True)
     shutil.rmtree(save_root, ignore_errors=True)
+    config_path = NER_ROOT / "SynSpERT" / "configs" / "config-coder.json"
     run(
         [
             "python",
@@ -167,6 +168,8 @@ def eval_model(model_dir: Path, dataset: Path, label: str) -> Dict[str, float]:
             str(dataset),
             "--label",
             label,
+            "--config_override",
+            str(config_path),
             "--eval_batch_size",
             "2",
             "--log_path",
@@ -192,6 +195,7 @@ def predict_base(train_path: Path, bert_model: str) -> Path:
     save_root = TMP_ROOT / "save_pred_base"
     shutil.rmtree(log_root, ignore_errors=True)
     shutil.rmtree(save_root, ignore_errors=True)
+    config_path = NER_ROOT / "SynSpERT" / "configs" / "config-coder.json"
     run(
         [
             "python",
@@ -204,6 +208,8 @@ def predict_base(train_path: Path, bert_model: str) -> Path:
             str(train_path),
             "--label",
             "tiny_pred_base",
+            "--config_override",
+            str(config_path),
             "--eval_batch_size",
             "2",
             "--log_path",
