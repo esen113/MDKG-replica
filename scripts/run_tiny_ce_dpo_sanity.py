@@ -323,6 +323,7 @@ def train_dpo(train_path: Path, valid_path: Path, prefs: Path, bert_model: str) 
 def backup_and_swap_dataset(train_src: Path, valid_src: Path) -> tuple[Path, Path]:
     """Backup original train/valid JSON and swap in tiny split for training/eval."""
     datasets_dir = IO_ROOT / "data" / "datasets"
+    datasets_dir.mkdir(parents=True, exist_ok=True)
     orig_train = datasets_dir / "diabetes_train.json"
     orig_valid = datasets_dir / "diabetes_valid.json"
     bak_dir = TMP_ROOT / "bak"
