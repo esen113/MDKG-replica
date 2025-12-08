@@ -132,12 +132,6 @@ def train_ce(train_path: Path, valid_path: Path, bert_model: str) -> Path:
             "2",
             "--lr",
             "5e-5",
-            "--train_path",
-            str(train_path),
-            "--valid_path",
-            str(valid_path),
-            "--types_path",
-            str(REPO_ROOT / "nutrition_diabetes_types.json"),
             "--log_path",
             str(log_path),
             "--save_path",
@@ -290,12 +284,6 @@ def train_dpo(train_path: Path, valid_path: Path, prefs: Path, bert_model: str) 
             "2",
             "--lr",
             "3e-5",
-            "--train_path",
-            str(train_path),
-            "--valid_path",
-            str(valid_path),
-            "--types_path",
-            str(REPO_ROOT / "nutrition_diabetes_types.json"),
             "--log_path",
             str(log_path),
             "--save_path",
@@ -332,6 +320,37 @@ def train_dpo(train_path: Path, valid_path: Path, prefs: Path, bert_model: str) 
     return model_dir
 
 
+def backup_and_swap_dataset(train_src: Path, valid_src: Path) -> tuple[Path, Path]:
+    """Backup original train/valid JSON and swap in tiny split for training/eval."""
+    datasets_dir = IO_ROOT / "data" / "datasets"
+    orig_train = datasets_dir / "diabetes_train.json"
+    orig_valid = datasets_dir / "diabetes_valid.json"
+    bak_dir = TMP_ROOT / "bak"
+    bak_dir.mkdir(parents=True, exist_ok=True)
+    bak_train = bak_dir / "diabetes_train.json.bak"
+    bak_valid = bak_dir / "diabetes_valid.json.bak"
+    if orig_train.exists():
+        shutil.copy2(orig_train, bak_train)
+    if orig_valid.exists():
+        shutil.copy2(orig_valid, bak_valid)
+    shutil.copy2(train_src, orig_train)
+    shutil.copy2(valid_src, orig_valid)
+    print(f"[DATA] Swapped datasets: {orig_train} <- tiny train, {orig_valid} <- tiny valid")
+    return bak_train, bak_valid
+
+
+def restore_dataset(backups: tuple[Path, Path]) -> None:
+    datasets_dir = IO_ROOT / "data" / "datasets"
+    orig_train = datasets_dir / "diabetes_train.json"
+    orig_valid = datasets_dir / "diabetes_valid.json"
+    bak_train, bak_valid = backups
+    if bak_train.exists():
+        shutil.copy2(bak_train, orig_train)
+    if bak_valid.exists():
+        shutil.copy2(bak_valid, orig_valid)
+    print("[DATA] Restored original datasets")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tiny CE vs DPO sanity check.")
     parser.add_argument("--bert-model", default="GanjinZero/coder_eng_pp", help="Backbone encoder path or HF id.")
@@ -341,22 +360,26 @@ def main() -> None:
     ensure_data()
     train_path, valid_path = sample_tiny(seed=args.seed)
 
-    ce_model = train_ce(train_path, valid_path, args.bert_model)
-    ce_metrics = eval_model(ce_model, valid_path, "tiny_ce_eval")
+    backups = backup_and_swap_dataset(train_path, valid_path)
+    try:
+        ce_model = train_ce(train_path, valid_path, args.bert_model)
+        ce_metrics = eval_model(ce_model, valid_path, "tiny_ce_eval")
 
-    pred_path = predict_base(train_path, args.bert_model)
-    prefs_path = TMP_ROOT / "prefs.jsonl"
-    build_prefs(train_path, pred_path, prefs_path)
+        pred_path = predict_base(train_path, args.bert_model)
+        prefs_path = TMP_ROOT / "prefs.jsonl"
+        build_prefs(train_path, pred_path, prefs_path)
 
-    dpo_model = train_dpo(train_path, valid_path, prefs_path, args.bert_model)
-    dpo_metrics = eval_model(dpo_model, valid_path, "tiny_dpo_eval")
+        dpo_model = train_dpo(train_path, valid_path, prefs_path, args.bert_model)
+        dpo_metrics = eval_model(dpo_model, valid_path, "tiny_dpo_eval")
 
-    print("\n=== Summary (tiny set) ===")
-    print(f"CE  : NER F1 {ce_metrics['ner_f1']:.2f}, REL F1 {ce_metrics['rel_f1']:.2f}, "
-          f"REL+NEC F1 {ce_metrics['rel_nec_f1']:.2f}")
-    print(f"DPO : NER F1 {dpo_metrics['ner_f1']:.2f}, REL F1 {dpo_metrics['rel_f1']:.2f}, "
-          f"REL+NEC F1 {dpo_metrics['rel_nec_f1']:.2f}")
-    print("Artifacts under tmp_tiny/.")
+        print("\n=== Summary (tiny set) ===")
+        print(f"CE  : NER F1 {ce_metrics['ner_f1']:.2f}, REL F1 {ce_metrics['rel_f1']:.2f}, "
+              f"REL+NEC F1 {ce_metrics['rel_nec_f1']:.2f}")
+        print(f"DPO : NER F1 {dpo_metrics['ner_f1']:.2f}, REL F1 {dpo_metrics['rel_f1']:.2f}, "
+              f"REL+NEC F1 {dpo_metrics['rel_nec_f1']:.2f}")
+        print("Artifacts under tmp_tiny/.")
+    finally:
+        restore_dataset(backups)
 
 
 if __name__ == "__main__":
